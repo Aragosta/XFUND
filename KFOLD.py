@@ -1,7 +1,7 @@
 # PURGED K FOLD CROSS VALIDATION & EMBARGO
 import pandas as pd
 import numpy as np
-
+from sklearn.model_selection import KFold
 
 
 def getTrainTimes(t1,testTimes):
@@ -39,7 +39,7 @@ def getEmbargoTimes(times,pctEmbargo):
         mbrg=mbrg.append(pd.Series(times[-1],index=times[-step:]))
     return mbrg
 
-class PurgedKFold():
+class PurgedKFold(KFold):
     '''
     Extend KFold class to work with labels that span intervals
     The train is purged of observations overlapping test-label intervals

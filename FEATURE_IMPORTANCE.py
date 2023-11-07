@@ -57,6 +57,58 @@ def auxFeatImpSFI(featNames, clf, trnsX, cont, scoring, cvGen):
         imp.loc[featName, 'std'] = df0.std() * df0.shape[0]**-.5
     return imp
 
+
+
+def featImportance(trnsX,cont,n_estimators=1000,cv=10,max_samples=1.,numThreads=24, pctEmbargo=0,scoring='accuracy',method='SFI',minWLeaf=0.,**kargs):
+    # feature importance from a random forest
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.ensemble import BaggingClassifier
+    
+    n_jobs=(-1 if numThreads>1 else 1) 
+    # run 1 thread with ht_helper in dirac1 #1) prepare classifier,cv. max_features=1, to prevent masking
+    clf=DecisionTreeClassifier(criterion='entropy',max_features=1,
+    class_weight='balanced',min_weight_fraction_leaf=minWLeaf) 
+    clf=BaggingClassifier(base_estimator=clf,n_estimators=n_estimators,
+    max_features=1.,max_samples=max_samples,oob_score=True,n_jobs=n_jobs)
+    fit=clf.fit(X=trnsX,y=cont['bin'],sample_weight=cont['w'].values) 
+    oob=fit.oob_score_
+    if method=='MDA':
+        imp,oos=featImpMDA(clf,X=trnsX,y=cont['bin'],cv=cv,sample_weight=cont['w'], t1=cont['t1'],pctEmbargo=pctEmbargo,scoring=scoring)
+        cvGen=KFOLD.PurgedKFold(n_splits=cv,t1=cont['t1'],pctEmbargo=pctEmbargo) 
+    elif method=='SFI': 
+        cvGen=KFOLD.PurgedKFold(n_splits=cv,t1=cont['t1'],pctEmbargo=pctEmbargo) 
+        oos=KFOLD.cvScore(clf,X=trnsX,y=cont['bin'],sample_weight=cont['w'],scoring=scoring,
+    cvGen=cvGen).mean()
+    clf.n_jobs=1 # paralellize auxFeatImpSFI rather than clf 
+    imp=MP.MultiProcessingFunctions.mp_pandas_obj(auxFeatImpSFI,('featNames',trnsX.columns),numThreads,
+    clf=clf,trnsX=trnsX,cont=cont,scoring=scoring,cvGen=cvGen) 
+    return imp,oob,oos
+
+
+def plotFeatImportance(imp, oob, oos, method, tag=0, simNum=0, **kargs):
+    # plot mean imp bars with std
+    plt.figure(figsize=(10, imp.shape[0] / 5.))
+    imp = imp.sort_values('mean', ascending=True)
+    ax = imp['mean'].plot(kind='barh', color='b', alpha=.25, xerr=imp['std'], error_kw={'ecolor': 'r'})
+
+    if method == 'MDI':
+        plt.xlim([0, imp.sum(axis=1).max()])
+        plt.axvline(1. / imp.shape[0], linewidth=1, color='r', linestyle='dotted')
+    else:
+        plt.xlim([imp['mean'].min() - imp['std'].max(), imp['mean'].max() + imp['std'].max()])
+
+    ax.get_yaxis().set_visible(False)
+    for i, j in zip(ax.patches, imp.index):
+        ax.text(i.get_width() / 2, i.get_y() + i.get_height() / 2, j, ha='center', va='center', color='black')
+
+    plt.title(f'tag={tag} | simNum={simNum} | oob={round(oob, 4)} | oos={round(oos, 4)}')
+    plt.clf()
+    plt.show()
+    return
+
+
+## PCA
+
 def get_eVec(dot,varThres):
     # Compute eVec from dot prod matrix, reduce dimension
     eVal,eVec=np.linalg.eigh(dot)
@@ -79,51 +131,3 @@ def orthoFeats(dfX,varThres=.95):
     eVal,eVec=get_eVec(dot,varThres)
     dfP=np.dot(dfZ,eVec)
     return dfP
-
-def featImportance(trnsX,cont,n_estimators=1000,cv=10,max_samples=1.,numThreads=24, pctEmbargo=0,scoring='accuracy',method='SFI',minWLeaf=0.,**kargs):
-    # feature importance from a random forest
-    from sklearn.tree import DecisionTreeClassifier
-    from sklearn.ensemble import BaggingClassifier
-    
-    n_jobs=(-1 if numThreads>1 else 1) 
-    # run 1 thread with ht_helper in dirac1 #1) prepare classifier,cv. max_features=1, to prevent masking
-    clf=DecisionTreeClassifier(criterion='entropy',max_features=1,
-    class_weight='balanced',min_weight_fraction_leaf=minWLeaf) 
-    clf=BaggingClassifier(base_estimator=clf,n_estimators=n_estimators,
-    max_features=1.,max_samples=max_samples,oob_score=True,n_jobs=n_jobs)
-    fit=clf.fit(X=trnsX,y=cont['bin'],sample_weight=cont['w'].values) 
-    oob=fit.oob_score_
-    if method=='MDA':
-        imp,oos=featImpMDA(clf,X=trnsX,y=cont['bin'],cv=cv,sample_weight=cont['w'], t1=cont['t1'],pctEmbargo=pctEmbargo,scoring=scoring)
-    elif method=='SFI': 
-        cvGen=KFOLD.PurgedKFold(n_splits=cv,t1=cont['t1'],pctEmbargo=pctEmbargo) 
-        oos=KFOLD.cvScore(clf,X=trnsX,y=cont['bin'],sample_weight=cont['w'],scoring=scoring,
-    cvGen=cvGen).mean()
-    clf.n_jobs=1 # paralellize auxFeatImpSFI rather than clf 
-    imp=MP.MultiProcessingFunctions.mp_pandas_obj(auxFeatImpSFI,('featNames',trnsX.columns),numThreads,
-    clf=clf,trnsX=trnsX,cont=cont,scoring=scoring,cvGen=cvGen) 
-    return imp,oob,oos
-
-
-def plotFeatImportance(pathOut, imp, oob, oos, method, tag=0, simNum=0, **kargs):
-    # plot mean imp bars with std
-    plt.figure(figsize=(10, imp.shape[0] / 5.))
-    imp = imp.sort_values('mean', ascending=True)
-    ax = imp['mean'].plot(kind='barh', color='b', alpha=.25, xerr=imp['std'], error_kw={'ecolor': 'r'})
-
-    if method == 'MDI':
-        plt.xlim([0, imp.sum(axis=1).max()])
-        plt.axvline(1. / imp.shape[0], linewidth=1, color='r', linestyle='dotted')
-    else:
-        plt.xlim([imp['mean'].min() - imp['std'].max(), imp['mean'].max() + imp['std'].max()])
-
-    ax.get_yaxis().set_visible(False)
-    for i, j in zip(ax.patches, imp.index):
-        ax.text(i.get_width() / 2, i.get_y() + i.get_height() / 2, j, ha='center', va='center', color='black')
-
-    plt.title(f'tag={tag} | simNum={simNum} | oob={round(oob, 4)} | oos={round(oos, 4)}')
-    plt.savefig(f'{pathOut}featImportance_{simNum}.png', dpi=100)
-    plt.clf()
-    plt.close()
-
-    return
