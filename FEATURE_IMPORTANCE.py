@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import KFOLD
 import MP
+from sklearn.metrics import f1_score
 
 def featImpMDA(clf, X, y, cv, sample_weight, t1, pctEmbargo, scoring='neg_log_loss'):
     # feat importance based on OOS score reduction
@@ -102,8 +103,8 @@ def plotFeatImportance(imp, oob, oos, method, tag=0, simNum=0, **kargs):
         ax.text(i.get_width() / 2, i.get_y() + i.get_height() / 2, j, ha='center', va='center', color='black')
 
     plt.title(f'tag={tag} | simNum={simNum} | oob={round(oob, 4)} | oos={round(oos, 4)}')
-    plt.clf()
     plt.show()
+    plt.clf()
     return
 
 
