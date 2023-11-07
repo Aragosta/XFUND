@@ -79,7 +79,7 @@ class MultiProcessingFunctions:
 			return out
 
 		for i in out:
-			df0 = df0.append(i)
+			df0 = pd.concat([df0, i])
 
 		df0 = df0.sort_index()
 		return df0
