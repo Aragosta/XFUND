@@ -15,7 +15,7 @@ def getTrainTimes(t1,testTimes):
     trn: A pandas Series with the train start and end times
     '''
     trn=t1.copy(deep=True)
-    for i,j in testTimes.iteritems():
+    for i,j in testTimes.items():
         df0=trn[(i<=trn.index)&(trn.index<=j)].index # train starts within test
         df1=trn[(i<=trn)&(trn<=j)].index # train ends within test
         df2=trn[(trn.index<=i)&(j<=trn)].index # train envelops test
