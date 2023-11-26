@@ -60,7 +60,7 @@ def auxFeatImpSFI(featNames, clf, trnsX, cont, scoring, cvGen):
 
 
 
-def featImportance(trnsX,cont,n_estimators=1000,cv=10,max_samples=1.,numThreads=24, pctEmbargo=0,scoring='accuracy',method='SFI',minWLeaf=0.,**kargs):
+def featImportance(trnsX,cont,n_estimators=1000,cv=10,max_samples=1.,numThreads=24, pctEmbargo=0.01,scoring='accuracy',method='SFI',minWLeaf=0.,**kargs):
     # feature importance from a random forest
     from sklearn.tree import DecisionTreeClassifier
     from sklearn.ensemble import BaggingClassifier
