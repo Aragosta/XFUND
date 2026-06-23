@@ -331,5 +331,322 @@ def backtest(csv_path=None):
     return results
 
 
+# ── Archive data loader & BACKTEST.py integration ────────────────────────────
+
+def load_sp500_archive(csv_path: str) -> tuple:
+    """
+    Load the Kaggle S&P 500 all_stocks_5yr.csv archive (or any file with the
+    same columns: date, open, high, low, close, volume, Name).
+
+    Returns
+    -------
+    prices_daily  : pd.DataFrame  daily close prices      (T_daily  × N_stocks)
+    rets_monthly  : pd.DataFrame  monthly returns ±50%    (T_monthly × N_stocks)
+    size_monthly  : pd.DataFrame  Close×Volume proxy       (T_monthly × N_stocks)
+    """
+    df = (
+        pd.read_csv(csv_path, parse_dates=["date"])
+        .sort_values("date")
+    )
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Wide daily close prices — required by BACKTEST.backtest()
+    prices_daily = (
+        df.pivot_table(index="date", columns="Name", values="close", aggfunc="last")
+        .sort_index()
+    )
+    prices_daily.index = pd.to_datetime(prices_daily.index)
+    prices_daily.columns.name = None
+
+    # Monthly (month-end) prices and volume for the DM feature engine
+    prices_monthly = prices_daily.resample("ME").last()
+
+    volume_daily = (
+        df.pivot_table(index="date", columns="Name", values="volume", aggfunc="last")
+        .sort_index()
+    )
+    volume_daily.index = pd.to_datetime(volume_daily.index)
+    volume_monthly = volume_daily.resample("ME").last()
+
+    size_monthly  = prices_monthly * volume_monthly
+    rets_monthly  = prices_monthly.pct_change().clip(-0.5, 0.5)
+
+    print(
+        f"[load] daily prices : {prices_daily.shape}  "
+        f"({prices_daily.index[0].date()} – {prices_daily.index[-1].date()})"
+    )
+    print(
+        f"[load] monthly rets : {rets_monthly.shape}  "
+        f"({rets_monthly.index[0].date()} – {rets_monthly.index[-1].date()})"
+    )
+    return prices_daily, rets_monthly, size_monthly
+
+
+def generate_dm_weights(
+    rets: pd.DataFrame,
+    size: pd.DataFrame,
+    *,
+    strategy: str = "srp",
+    portfolio: str = "ls",
+    q: float = TOP_Q,
+    min_train_months: int = 18,
+    n_seeds: int = N_SEEDS,
+) -> pd.DataFrame:
+    """
+    Run the Deep Momentum signal loop and return a monthly weights DataFrame
+    ready to plug into BACKTEST.py's ``backtest()`` function.
+
+    Parameters
+    ----------
+    rets, size      : monthly DataFrames produced by ``load_sp500_archive()``
+    strategy        : ``'dpr'``, ``'ret'``, ``'srp'``, or ``'bench'`` (zMOM12)
+    portfolio       : ``'ls'`` (long-short, equal-weight ±1/n) or ``'lo'`` (long-only)
+    min_train_months: minimum months of history before first prediction.
+                      Use ≤30 for the 5-year archive; the paper uses 120 (10 years).
+    n_seeds         : XGBoost ensemble size (reduce for faster runs, e.g. 3)
+
+    Returns
+    -------
+    weights_df : pd.DataFrame  indexed by signal dates (month-end of the period
+                               *before* the holding month), columns = tickers.
+                               Designed for forward-fill into a daily prices index.
+
+    Timing convention
+    -----------------
+    Signal date  = rets.index[t-1]  (last trading day of month t-1)
+    Hold period  = month t          (rets.iloc[t])
+    With lag=1 in BACKTEST.backtest(), execution lands on the first
+    trading day of month t — no look-ahead.
+    """
+    T          = len(rets)
+    first_feat = max(MOM_WINDOWS) + 1
+    first_pred = min_train_months + first_feat
+    # Adaptive validation split: last third of training window (minimum 6 months)
+    val_months = max(6, min_train_months // 3)
+
+    if first_pred >= T - 1:
+        raise ValueError(
+            f"Need ≥ {first_pred + 1} monthly observations; got {T}. "
+            f"Reduce min_train_months (currently {min_train_months})."
+        )
+
+    # Pre-compute features and labels once
+    pool = {}
+    for t in range(first_feat, T - 1):
+        F   = make_features(rets, size, t).dropna()
+        L   = make_labels(rets, t)
+        idx = (
+            F.index
+             .intersection(L.index)
+             .intersection(rets.iloc[t].dropna().index)
+        )
+        if len(idx) >= 20:
+            pool[t] = (F.loc[idx], L.loc[idx])
+
+    weight_rows = {}   # signal_date → pd.Series of weights
+    model_store = {}   # year → (models, mu_k, sigma2_k)
+
+    pred_years = sorted({rets.index[t].year for t in range(first_pred, T - 1)})
+
+    for year in pred_years:
+        months = [t for t in range(first_pred, T - 1) if rets.index[t].year == year]
+        if not months:
+            continue
+        t_cut       = months[0]
+        val_t_start = t_cut - val_months
+
+        tr_ts = [t for t in pool if first_feat <= t < val_t_start]
+        va_ts = [t for t in pool if val_t_start <= t < t_cut]
+
+        if len(tr_ts) >= 12 and len(va_ts) >= 6:
+            X_tr = pd.concat([pool[t][0] for t in tr_ts])
+            y_tr = pd.concat([pool[t][1] for t in tr_ts])
+            X_va = pd.concat([pool[t][0] for t in va_ts])
+            y_va = pd.concat([pool[t][1] for t in va_ts])
+
+            fwd_tr  = pd.concat([rets.iloc[t].reindex(pool[t][0].index) for t in tr_ts])
+            lab_tr  = pd.concat([pool[t][1] for t in tr_ts])
+            grp     = pd.DataFrame({"l": lab_tr.values, "r": fwd_tr.values}).groupby("l")["r"]
+            mu_k    = np.array([grp.get_group(k).mean() if k in grp.groups else 0.0  for k in range(10)])
+            sigma2_k = np.array([grp.get_group(k).var()  if k in grp.groups else 1e-4 for k in range(10)])
+
+            print(f"  [{year}] train={len(X_tr):,}  val={len(X_va):,} obs  — fitting {n_seeds} models")
+            xgb_p = {**XGB_PARAMS, "n_estimators": min(XGB_PARAMS["n_estimators"], 200)}
+            models = [
+                XGBClassifier(**xgb_p, random_state=s).fit(
+                    X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False
+                )
+                for s in range(n_seeds)
+            ]
+            model_store[year] = (models, mu_k, sigma2_k)
+
+        elif model_store:
+            model_store[year] = list(model_store.values())[-1]
+        else:
+            continue
+
+        mdls, mu_k, sigma2_k = model_store[year]
+
+        for t in months:
+            if t not in pool:
+                continue
+            F, _         = pool[t]
+            signal_date  = rets.index[t - 1]   # end of month t-1 → trade at open of month t
+
+            probs = np.mean([m.predict_proba(F) for m in mdls], axis=0)
+
+            if strategy == "bench":
+                scores = F["zMOM12"].values
+            elif strategy == "dpr":
+                scores = score_dpr(probs)
+            elif strategy == "ret":
+                scores = score_ret(probs, mu_k)
+            elif strategy == "srp":
+                scores = score_srp(probs, mu_k, sigma2_k)
+            else:
+                raise ValueError(f"Unknown strategy '{strategy}'. Use 'dpr','ret','srp','bench'.")
+
+            s_ser = pd.Series(scores, index=F.index)
+            n     = max(1, int(len(s_ser) * q))
+            w     = pd.Series(0.0, index=F.index)
+            w[s_ser.nlargest(n).index]  = +1.0 / n
+            if portfolio == "ls":
+                w[s_ser.nsmallest(n).index] = -1.0 / n
+
+            weight_rows[signal_date] = w
+
+    if not weight_rows:
+        raise ValueError(
+            "No weights generated. Increase data length or decrease min_train_months."
+        )
+
+    weights_df = (
+        pd.DataFrame(weight_rows)
+        .T
+        .fillna(0.0)
+        .sort_index()
+    )
+    weights_df.index.name = "date"
+    print(
+        f"[weights] {len(weights_df)} signal dates  "
+        f"({weights_df.index[0].date()} – {weights_df.index[-1].date()})"
+    )
+    return weights_df
+
+
+def run_with_backtest(
+    csv_path: str,
+    *,
+    strategy: str = "srp",
+    portfolio: str = "ls",
+    q: float = TOP_Q,
+    min_train_months: int = 18,
+    transaction_cost: float = 0.001,
+    freq: int = 252,
+    lag: int = 1,
+    n_seeds: int = 3,
+) -> dict:
+    """
+    Full pipeline for the Kaggle S&P 500 archive:
+        load data  →  generate DM weights  →  call BACKTEST.backtest()
+
+    Requires ``BACKTEST.py`` in the same directory (or on ``sys.path``).
+
+    Parameters
+    ----------
+    csv_path         : path to ``all_stocks_5yr.csv`` (columns: date,open,high,low,close,volume,Name)
+    strategy         : ``'dpr'``, ``'ret'``, ``'srp'``, or ``'bench'``
+    portfolio        : ``'ls'`` (long-short) or ``'lo'`` (long-only)
+    min_train_months : keep ≤ 30 for the 5-year archive; default 18 gives ~3 years OOS
+    transaction_cost : round-trip cost as fraction of traded notional (e.g. 0.001 = 10 bps)
+    freq             : annualisation factor (252 for daily prices)
+    lag              : execution lag in trading days (1 = signal at close t → trade at close t+1)
+    n_seeds          : ensemble size; reduce to 3–5 for faster testing
+
+    Returns
+    -------
+    dict from BACKTEST.backtest() with keys:
+        returns, equity, drawdown, ann_return, sharpe, max_drawdown, …
+    """
+    try:
+        import BACKTEST
+    except ImportError:
+        raise ImportError(
+            "BACKTEST.py not found. Make sure BACKTEST.py is in the same directory."
+        )
+
+    # 1. Load data
+    prices_daily, rets_monthly, size_monthly = load_sp500_archive(csv_path)
+
+    # 2. Generate DM weights (monthly signal dates)
+    print(f"\nGenerating DM-{strategy.upper()} {portfolio.upper()} weights …")
+    weights = generate_dm_weights(
+        rets_monthly, size_monthly,
+        strategy=strategy, portfolio=portfolio,
+        q=q, min_train_months=min_train_months,
+        n_seeds=n_seeds,
+    )
+
+    # 3. Map each monthly signal date to the nearest prior trading day in prices_daily
+    #    (month-end dates from resample may be weekends or holidays)
+    daily_idx   = prices_daily.index
+    signal_dates = []
+    mapped_index = []
+    for d in weights.index:
+        prior = daily_idx[daily_idx <= d]
+        if len(prior):
+            td = prior[-1]
+            signal_dates.append(td)
+            mapped_index.append(td)
+
+    weights_mapped = weights.copy()
+    weights_mapped.index = pd.DatetimeIndex(mapped_index)
+    weights_mapped = weights_mapped[~weights_mapped.index.duplicated(keep="last")]
+
+    # 4. Restrict daily prices to tickers present in weights and trim to OOS start
+    common_tickers = weights_mapped.columns.intersection(prices_daily.columns).tolist()
+    oos_start      = signal_dates[0]
+    prices_oos     = prices_daily.loc[oos_start:, common_tickers]
+    weights_oos    = weights_mapped.reindex(columns=common_tickers).fillna(0.0)
+
+    print(
+        f"\n[backtest] OOS window : {oos_start.date()} – {prices_oos.index[-1].date()}"
+        f"  ({len(prices_oos)} trading days,  {len(signal_dates)} rebalances)"
+    )
+    print(f"[backtest] Universe   : {len(common_tickers)} tickers")
+
+    # 5. Call BACKTEST.backtest()
+    result = BACKTEST.backtest(
+        weights=weights_oos,
+        prices=prices_oos,
+        freq=freq,
+        lag=lag,
+        transaction_cost=transaction_cost,
+        signal_dates=signal_dates,
+        compute_risk_metrics=False,   # skip expensive MRC loop for PoC speed
+    )
+
+    # 6. Print summary
+    print(f"\n── DM-{strategy.upper()} {portfolio.upper()} Results {'─'*30}")
+    print(f"  Annual Return  : {result['ann_return']:>8.2%}")
+    print(f"  Annual Vol     : {result['ann_vol']:>8.2%}")
+    print(f"  Sharpe Ratio   : {result['sharpe']:>8.3f}")
+    print(f"  Max Drawdown   : {result['max_drawdown']:>8.2%}")
+    print(f"  Total Return   : {result['total_return']:>8.2%}")
+    print(f"  Ann. Turnover  : {result['ann_turnover']:>8.2%}")
+
+    return result
+
+
 if __name__ == "__main__":
-    backtest(sys.argv[1] if len(sys.argv) > 1 else None)
+    import os
+    args = sys.argv[1:]
+    if args and os.path.isfile(args[0]) and args[0].endswith(".csv"):
+        # Run the BACKTEST.py-integrated pipeline on the archive
+        # Example: python deep_momentum_xgb.py all_stocks_5yr.csv srp ls
+        csv   = args[0]
+        strat = args[1] if len(args) > 1 else "srp"
+        port  = args[2] if len(args) > 2 else "ls"
+        run_with_backtest(csv, strategy=strat, portfolio=port, min_train_months=18, n_seeds=3)
+    else:
+        backtest(args[0] if args else None)
