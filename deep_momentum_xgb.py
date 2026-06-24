@@ -441,9 +441,12 @@ def load_broad_universe_tiingo(
     if verbose:
         print(f"[tiingo] {len(remaining):,} tickers left to fetch …")
 
-    # ── 4. Download in parallel ───────────────────────────────────────────────
-    BASE = "https://api.tiingo.com/tiingo/daily"
+    # ── 4. Download in parallel with rate-limit retry ─────────────────────────
+    import threading, time as _time
+    BASE    = "https://api.tiingo.com/tiingo/daily"
     HEADERS = {"Authorization": f"Token {api_key}", "Content-Type": "application/json"}
+    _rate_lock  = threading.Lock()
+    _last_429   = [0.0]   # shared mutable slot
 
     def fetch_ticker(ticker: str) -> tuple[str, pd.DataFrame | None]:
         url = (
@@ -451,20 +454,32 @@ def load_broad_universe_tiingo(
             f"?startDate={start_date}&endDate={end_date}"
             f"&resampleFreq=monthly&token={api_key}"
         )
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=20)
-            if resp.status_code == 404:
-                return ticker, None
-            resp.raise_for_status()
-            data = resp.json()
-            if not data:
-                return ticker, None
-            df = pd.DataFrame(data)
-            df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-            df = df.set_index("date")[["adjClose", "adjVolume"]].dropna(how="all")
-            return ticker, df
-        except Exception:
-            return ticker, None
+        for attempt in range(5):
+            # back off if a 429 was seen recently by any thread
+            with _rate_lock:
+                wait = _last_429[0] + 65 - _time.time()
+            if wait > 0:
+                _time.sleep(wait)
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=20)
+                if resp.status_code == 404:
+                    return ticker, None
+                if resp.status_code == 429:
+                    with _rate_lock:
+                        _last_429[0] = _time.time()
+                    _time.sleep(65 + attempt * 10)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                if not data:
+                    return ticker, None
+                df = pd.DataFrame(data)
+                df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+                df = df.set_index("date")[["adjClose", "adjVolume"]].dropna(how="all")
+                return ticker, df
+            except Exception:
+                _time.sleep(2 ** attempt)
+        return ticker, None
 
     CHECKPOINT_EVERY = 200
     fetched_since_ckpt = 0
@@ -484,7 +499,6 @@ def load_broad_universe_tiingo(
                 print(f"[tiingo] {n_done:,}/{n_total:,} fetched  "
                       f"({len(done):,} with data)")
 
-            # save checkpoint periodically
             if fetched_since_ckpt >= CHECKPOINT_EVERY:
                 _save_tiingo_checkpoint(done, checkpoint_path)
                 fetched_since_ckpt = 0
