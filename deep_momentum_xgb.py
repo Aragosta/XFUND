@@ -346,6 +346,7 @@ def load_broad_universe_tiingo(
     cache_path: str = "tiingo_universe_cache.parquet",
     checkpoint_path: str = "tiingo_download_checkpoint.parquet",
     max_workers: int = 20,
+    skip_download: bool = False,
     verbose: bool = True,
 ) -> tuple:
     """
@@ -392,38 +393,11 @@ def load_broad_universe_tiingo(
         except Exception:
             pass
 
-    # ── 2. Get ticker universe from Tiingo supported_tickers.zip ─────────────
-    TICKER_ZIP_URL = "https://apimedia.tiingo.com/docs/tiingo/daily/supported_tickers.zip"
-    if verbose:
-        print("[tiingo] downloading ticker universe …")
-    r = requests.get(TICKER_ZIP_URL, timeout=30)
-    r.raise_for_status()
-    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-        csv_name = z.namelist()[0]
-        ticker_df = pd.read_csv(z.open(csv_name))
-
-    # filter: US exchanges, common stock, active during our window
-    us = ticker_df[
-        ticker_df["exchange"].isin(["NYSE", "NASDAQ"]) &
-        (ticker_df["assetType"] == "Stock")
-    ].copy()
-    us["startDate"] = pd.to_datetime(us["startDate"], errors="coerce")
-    us["endDate"]   = pd.to_datetime(us["endDate"],   errors="coerce")
-
-    # keep only tickers that were alive at some point since start_date
-    us = us[us["endDate"].isna() | (us["endDate"] >= pd.Timestamp(start_date))]
-    tickers = us["ticker"].dropna().unique().tolist()
-
-    if verbose:
-        print(f"[tiingo] {len(tickers):,} US common stocks to download "
-              f"(NYSE+NASDAQ, active since {start_date})")
-
-    # ── 3. Load checkpoint (already-downloaded tickers) ───────────────────────
-    done: dict[str, pd.DataFrame] = {}   # ticker → monthly DataFrame
+    # ── 2. Load checkpoint ────────────────────────────────────────────────────
+    done: dict[str, pd.DataFrame] = {}
     if os.path.exists(checkpoint_path):
         try:
             ckpt = pd.read_parquet(checkpoint_path)
-            # checkpoint stores stacked: MultiIndex (metric, ticker) columns
             if isinstance(ckpt.columns, pd.MultiIndex):
                 for ticker in ckpt["close"].columns:
                     sub = pd.DataFrame({
@@ -433,79 +407,105 @@ def load_broad_universe_tiingo(
                     if not sub.empty:
                         done[ticker] = sub
                 if verbose:
-                    print(f"[tiingo] checkpoint: {len(done):,} tickers already downloaded")
+                    print(f"[tiingo] checkpoint: {len(done):,} tickers loaded")
         except Exception:
             pass
 
-    remaining = [t for t in tickers if t not in done]
-    if verbose:
-        print(f"[tiingo] {len(remaining):,} tickers left to fetch …")
+    if skip_download:
+        if not done:
+            raise ValueError("skip_download=True but no checkpoint found at " + checkpoint_path)
+        if verbose:
+            print(f"[tiingo] skipping download — using {len(done):,} tickers from checkpoint")
+    else:
+        # ── 3. Get full ticker universe and download remaining ────────────────
+        TICKER_ZIP_URL = "https://apimedia.tiingo.com/docs/tiingo/daily/supported_tickers.zip"
+        if verbose:
+            print("[tiingo] downloading ticker universe …")
+        r = requests.get(TICKER_ZIP_URL, timeout=30)
+        r.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            ticker_df = pd.read_csv(z.open(z.namelist()[0]))
 
-    # ── 4. Download in parallel with rate-limit retry ─────────────────────────
-    import threading, time as _time
-    BASE    = "https://api.tiingo.com/tiingo/daily"
-    HEADERS = {"Authorization": f"Token {api_key}", "Content-Type": "application/json"}
-    _rate_lock  = threading.Lock()
-    _last_429   = [0.0]   # shared mutable slot
+        us = ticker_df[
+            ticker_df["exchange"].isin(["NYSE", "NASDAQ"]) &
+            (ticker_df["assetType"] == "Stock")
+        ].copy()
+        us["startDate"] = pd.to_datetime(us["startDate"], errors="coerce")
+        us["endDate"]   = pd.to_datetime(us["endDate"],   errors="coerce")
+        us = us[us["endDate"].isna() | (us["endDate"] >= pd.Timestamp(start_date))]
+        tickers = us["ticker"].dropna().unique().tolist()
 
-    def fetch_ticker(ticker: str) -> tuple[str, pd.DataFrame | None]:
-        url = (
-            f"{BASE}/{ticker}/prices"
-            f"?startDate={start_date}&endDate={end_date}"
-            f"&resampleFreq=monthly&token={api_key}"
-        )
-        for attempt in range(5):
-            # back off if a 429 was seen recently by any thread
-            with _rate_lock:
-                wait = _last_429[0] + 65 - _time.time()
-            if wait > 0:
-                _time.sleep(wait)
-            try:
-                resp = requests.get(url, headers=HEADERS, timeout=20)
-                if resp.status_code == 404:
-                    return ticker, None
-                if resp.status_code == 429:
-                    with _rate_lock:
-                        _last_429[0] = _time.time()
-                    _time.sleep(65 + attempt * 10)
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                if not data:
-                    return ticker, None
-                df = pd.DataFrame(data)
-                df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-                df = df.set_index("date")[["adjClose", "adjVolume"]].dropna(how="all")
-                return ticker, df
-            except Exception:
-                _time.sleep(2 ** attempt)
-        return ticker, None
+        if verbose:
+            print(f"[tiingo] {len(tickers):,} US stocks  |  {len(done):,} already in checkpoint")
 
-    CHECKPOINT_EVERY = 200
-    fetched_since_ckpt = 0
+        remaining = [t for t in tickers if t not in done]
+        if verbose:
+            print(f"[tiingo] {len(remaining):,} tickers left to fetch …")
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(fetch_ticker, t): t for t in remaining}
-        n_total = len(futures)
-        n_done  = 0
-        for fut in as_completed(futures):
-            ticker, df = fut.result()
-            n_done += 1
-            if df is not None and not df.empty:
-                done[ticker] = df
-            fetched_since_ckpt += 1
+        # ── 4. Download in parallel with rate-limit retry ────────────────────
+        import threading, time as _time
+        BASE    = "https://api.tiingo.com/tiingo/daily"
+        HEADERS = {"Authorization": f"Token {api_key}", "Content-Type": "application/json"}
+        _rate_lock  = threading.Lock()
+        _last_429   = [0.0]
 
-            if verbose and n_done % 500 == 0:
-                print(f"[tiingo] {n_done:,}/{n_total:,} fetched  "
-                      f"({len(done):,} with data)")
+        def fetch_ticker(ticker: str) -> tuple[str, pd.DataFrame | None]:
+            url = (
+                f"{BASE}/{ticker}/prices"
+                f"?startDate={start_date}&endDate={end_date}"
+                f"&resampleFreq=monthly&token={api_key}"
+            )
+            for attempt in range(5):
+                with _rate_lock:
+                    wait = _last_429[0] + 65 - _time.time()
+                if wait > 0:
+                    _time.sleep(wait)
+                try:
+                    resp = requests.get(url, headers=HEADERS, timeout=20)
+                    if resp.status_code == 404:
+                        return ticker, None
+                    if resp.status_code == 429:
+                        with _rate_lock:
+                            _last_429[0] = _time.time()
+                        _time.sleep(65 + attempt * 10)
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if not data:
+                        return ticker, None
+                    df = pd.DataFrame(data)
+                    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+                    df = df.set_index("date")[["adjClose", "adjVolume"]].dropna(how="all")
+                    return ticker, df
+                except Exception:
+                    _time.sleep(2 ** attempt)
+            return ticker, None
 
-            if fetched_since_ckpt >= CHECKPOINT_EVERY:
-                _save_tiingo_checkpoint(done, checkpoint_path)
-                fetched_since_ckpt = 0
+        CHECKPOINT_EVERY = 200
+        fetched_since_ckpt = 0
 
-    _save_tiingo_checkpoint(done, checkpoint_path)
-    if verbose:
-        print(f"[tiingo] download complete: {len(done):,} tickers with data")
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(fetch_ticker, t): t for t in remaining}
+            n_total = len(futures)
+            n_done  = 0
+            for fut in as_completed(futures):
+                ticker, df = fut.result()
+                n_done += 1
+                if df is not None and not df.empty:
+                    done[ticker] = df
+                fetched_since_ckpt += 1
+
+                if verbose and n_done % 500 == 0:
+                    print(f"[tiingo] {n_done:,}/{n_total:,} fetched  "
+                          f"({len(done):,} with data)")
+
+                if fetched_since_ckpt >= CHECKPOINT_EVERY:
+                    _save_tiingo_checkpoint(done, checkpoint_path)
+                    fetched_since_ckpt = 0
+
+        _save_tiingo_checkpoint(done, checkpoint_path)
+        if verbose:
+            print(f"[tiingo] download complete: {len(done):,} tickers with data")
 
     # ── 5. Build wide matrices ─────────────────────────────────────────────────
     close_wide  = pd.DataFrame({t: done[t]["adjClose"]  for t in done}).sort_index()
@@ -1327,10 +1327,14 @@ if __name__ == "__main__":
 
     if args and args[0] == "--compare-tiingo":
         # python deep_momentum_xgb.py --compare-tiingo [start_date] [n_seeds]
-        start_yr = args[1] if len(args) > 1 else "2000-01-01"
-        seeds    = int(args[2]) if len(args) > 2 else N_SEEDS
+        start_yr   = args[1] if len(args) > 1 else "2000-01-01"
+        seeds      = int(args[2]) if len(args) > 2 else N_SEEDS
+        ckpt_exists = os.path.exists("tiingo_download_checkpoint.parquet")
         print(f"\n[tiingo] Loading broad universe (start={start_yr}, seeds={seeds}) …")
-        data = load_broad_universe_tiingo(start_date=start_yr)
+        data = load_broad_universe_tiingo(
+            start_date=start_yr,
+            skip_download=ckpt_exists,
+        )
         compare_strategies(data, n_seeds=seeds)
 
     elif args and os.path.isfile(args[0]) and args[0].endswith(".csv"):
