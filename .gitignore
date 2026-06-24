@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.nbc
+*.nbi
+*_yf_cache.parquet
+*.parquet
