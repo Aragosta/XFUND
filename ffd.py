@@ -296,6 +296,46 @@ def build_ffd_scores(
     return scores
 
 
+# ── 5b. Improved FFD features: uniform d + memory-preserving momentum ─────────
+
+def build_ffd_scores_v2(
+    prices_monthly: pd.DataFrame,
+    d_series: pd.Series,
+    windows: list[int] | None = None,
+    thres: float = 1e-5,
+) -> dict[int, pd.DataFrame]:
+    """
+    Cross-sectionally coherent FFD features (improved over build_ffd_scores).
+
+    Two fixes vs. v1:
+      1. UNIFORM d (cross-sectional median of d_series) applied to every ticker, so
+         the feature is the same transform for all names — required for the
+         cross-sectional z-scoring done downstream.  (v1 used a per-ticker d, which
+         makes z-scores across stocks incomparable.)
+      2. Memory-preserving MOMENTUM instead of a rolling mean of the level:
+           window 1  → FFD log-price LEVEL  (position vs. long-memory equilibrium)
+           window m>1 → ΔFFD_m = level_t - level_{t-m}   (slope in the stationary,
+                        memory-retaining domain — the FFD analog of MOM_m)
+      All series are causal (FIR filter + backward diff) → no look-ahead.
+
+    Default windows {1, 3, 12}: level + short slope + long slope.  Parsimonious to
+    avoid collinearity with the raw zMOM features.
+    """
+    if windows is None:
+        windows = [1, 3, 12]
+
+    common = prices_monthly.columns.intersection(d_series.index)
+    px     = prices_monthly[common]
+    d_unif = float(np.nanmedian(d_series.reindex(common).values))
+
+    level  = ffd_apply(px, d=d_unif, thres=thres)   # single scalar d → coherent
+
+    scores: dict[int, pd.DataFrame] = {}
+    for m in windows:
+        scores[m] = level.copy() if m == 1 else level.diff(m)
+    return scores
+
+
 # ── 6. CLI: inspect d values and FFD output ───────────────────────────────────
 
 if __name__ == "__main__":

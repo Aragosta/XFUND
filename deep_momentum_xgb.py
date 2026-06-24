@@ -86,32 +86,55 @@ def make_features(
     ffd_scores: dict | None = None,
 ) -> pd.DataFrame:
     """
-    Build (N_stocks × 20) feature matrix at time index t.  Matches Han & Qin (2022) Table 1.
+    Build feature matrix at time index t.  Paper Table 1 + dynamics (+ FFD).
 
-    20 features = 5 nMOM + 5 MMOM + 10 SIZE dummies (MOM-SZ-NOM spec).
-    sMOM is NOT a feature — std is used only to normalize, per paper Sec. 3.2.3.
+    Paper features (20): 5 nMOM + 5 MMOM + 10 SIZE dummies (MOM-SZ-NOM spec).
+    Added momentum-dynamics features (6), each z-scored cross-sectionally with its
+    cross-sectional mean retained (same treatment as nMOM/MMOM, paper Sec. 3.2.3):
+        ACCEL  recent (t-6..t-2) minus older (t-12..t-7) cumulative return  → rising/fading momentum
+        VOL    trailing 11-month cross-sectional realized vol               → momentum-risk conditioning
+        POS    fraction of up months over t-12..t-2                         → frog-in-the-pan consistency
+    If ffd_scores is supplied, 10 more (5 zFFD + 5 MFFD) are appended → 36 total.
+    All computed with one vectorized op over the cross-section (no Python loops over stocks).
     """
     feats = {}
 
+    def _zc(s: pd.Series, name: str):
+        """Cross-sectional z-score + retain the cross-sectional mean (macro state)."""
+        mu, sigma = s.mean(), s.std()
+        feats[f"z{name}"] = (s - mu) / (sigma + 1e-10)
+        feats[f"M{name}"] = mu
+
+    # ── Raw cumulative-return momentum (paper Eq. 6–8) — ALWAYS ───────────────
+    for m in MOM_WINDOWS:
+        if m == 1:
+            mom = rets.iloc[t - 1]
+        else:
+            mom = (1 + rets.iloc[t - m : t - 1]).prod() - 1
+        mu    = mom.mean()
+        sigma = mom.std()
+        feats[f"zMOM{m}"] = (mom - mu) / (sigma + 1e-10)
+        feats[f"MMOM{m}"] = mu
+
+    # ── Momentum-dynamics features (all vectorized across stocks) — ALWAYS ────
+    win = rets.iloc[t - 12 : t - 1]                          # months t-12..t-2 (11 rows)
+    mom_recent = (1 + rets.iloc[t - 6  : t - 1]).prod() - 1  # t-6..t-2
+    mom_older  = (1 + rets.iloc[t - 12 : t - 6]).prod() - 1  # t-12..t-7
+    _zc(mom_recent - mom_older, "ACCEL")                     # momentum acceleration
+    _zc(win.std(),              "VOL")                       # trailing realized vol
+    _zc((win > 0).mean(),       "POS")                       # fraction of up months
+
+    # ── FFD momentum (López de Prado, AFML Ch. 5) — ADDED when scores supplied ─
+    # Stationary, memory-preserving trend.  No look-ahead: optimal d is frozen on
+    # the pre-OOS training window and the FIR filter is causal (see
+    # _ffd_from_training_window).  Each window z-scored cross-sectionally + mean kept.
     if ffd_scores is not None:
-        # ── FFD mode ──────────────────────────────────────────────────────────
-        for m in MOM_WINDOWS:
+        for m in sorted(ffd_scores.keys()):     # decoupled from MOM_WINDOWS (e.g. {1,3,12})
             row   = ffd_scores[m].iloc[t - 1].reindex(rets.columns)
             mu    = row.mean()
             sigma = row.std()
             feats[f"zFFD{m}"] = (row - mu) / (sigma + 1e-10)
             feats[f"MFFD{m}"] = mu
-    else:
-        # ── Raw cumulative-return mode (paper Eq. 6–8) ────────────────────────
-        for m in MOM_WINDOWS:
-            if m == 1:
-                mom = rets.iloc[t - 1]
-            else:
-                mom = (1 + rets.iloc[t - m : t - 1]).prod() - 1
-            mu    = mom.mean()
-            sigma = mom.std()
-            feats[f"zMOM{m}"] = (mom - mu) / (sigma + 1e-10)
-            feats[f"MMOM{m}"] = mu
 
     # SIZE: 10 binary dummies D_s, s=1..10 (paper Sec. 3.3.1)
     cap         = size.iloc[t - 1].rank(pct=True, na_option="keep").fillna(0.5)
@@ -254,13 +277,12 @@ def backtest(csv_path=None):
             continue
         t_cut = months[0]
 
-        # ── Annual retraining with expanding window — random 80:20 split ─────
+        # ── Annual retraining, expanding window — time-blocked split (paper §4.1) ─
         all_ts_b = sorted([t for t in pool if t < t_cut])
         n_val_b  = max(12, int(len(all_ts_b) * 0.2))
-        rng_b    = np.random.default_rng(0)
-        vi_b     = set(rng_b.choice(len(all_ts_b), size=n_val_b, replace=False).tolist())
-        tr_ts    = [all_ts_b[i] for i in range(len(all_ts_b)) if i not in vi_b]
-        va_ts    = [all_ts_b[i] for i in vi_b]
+        n_tr_b   = len(all_ts_b) - n_val_b
+        tr_ts    = all_ts_b[:n_tr_b]      # earliest 80% of months
+        va_ts    = all_ts_b[n_tr_b:]      # most recent 20% held out for early stopping
 
         if len(tr_ts) >= 24 and len(va_ts) >= 12:
             X_tr = pd.concat([pool[t][0] for t in tr_ts])
@@ -515,7 +537,15 @@ def load_broad_universe_tiingo(
 
     prices_monthly = close_wide
     volume_monthly = volume_wide
-    rets_monthly   = prices_monthly.pct_change().clip(-0.5, 0.5)
+    # Return cleaning (paper §4.1): drop data errors (>+300% / <-95%), then winsorize
+    # at the CROSS-SECTIONAL 1/99 percentile each month.  Unlike a fixed ±50% clip,
+    # this stays wide during momentum-crash months (when many losers rebound together),
+    # so the short-side crash risk that should punish raw momentum is preserved.
+    _raw           = prices_monthly.pct_change()
+    _raw           = _raw.mask((_raw > 3.0) | (_raw < -0.95))
+    _lo            = _raw.quantile(0.01, axis=1)
+    _hi            = _raw.quantile(0.99, axis=1)
+    rets_monthly   = _raw.clip(_lo, _hi, axis=0)
     size_monthly   = (prices_monthly * volume_monthly).ffill()
 
     if verbose:
@@ -856,11 +886,12 @@ def _ffd_from_training_window(prices_monthly: pd.DataFrame, t_cut: int) -> dict:
 
     This is the correct way to use FFD inside a walk-forward backtest.
     """
-    from ffd import find_optimal_d_batch, build_ffd_scores
+    from ffd import find_optimal_d_batch, build_ffd_scores_v2
     prices_train = prices_monthly.iloc[:t_cut]
     d_series = find_optimal_d_batch(prices_train, n_jobs=-1, verbose=False)
-    # Apply to full series: causal filter → no leakage beyond d selection
-    return build_ffd_scores(prices_monthly, d_series, windows=MOM_WINDOWS)
+    # v2: uniform median d (cross-sectionally coherent) + FFD level & ΔFFD slopes.
+    # Causal filter applied to full series → no leakage beyond (training-only) d selection.
+    return build_ffd_scores_v2(prices_monthly, d_series, windows=[1, 3, 12])
 
 
 def _bench_weights(
@@ -888,7 +919,7 @@ def _bench_weights(
         if ffd_scores is None:
             print("  [bench FFD] computing optimal d on initial training window …")
             ffd_scores = _ffd_from_training_window(prices_monthly, first_pred)
-            for m in MOM_WINDOWS:
+            for m in list(ffd_scores.keys()):
                 ffd_scores[m] = ffd_scores[m].reindex(rets.index)
         signal_col = "zFFD12"
 
@@ -940,23 +971,25 @@ def _generate_all_dm_weights(
     if use_ffd and ffd_scores is None:
         print("  [DM FFD] initial optimal-d search on first training window …")
         ffd_scores = _ffd_from_training_window(prices_monthly, first_pred)
-        for m in MOM_WINDOWS:
+        for m in list(ffd_scores.keys()):
             ffd_scores[m] = ffd_scores[m].reindex(rets.index)
 
     if pool is None:
         pool = {}
         for t in range(first_feat, T - 1):
             F   = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
-            L   = make_labels(rets, t)
+            L   = make_labels(rets, t)                                   # t+1 horizon (month t)
+            L2  = make_labels(rets, t + 1) if (t + 1) < T else pd.Series(dtype=int)  # t+2 horizon
             idx = (
                 F.index
                  .intersection(L.index)
                  .intersection(rets.iloc[t].dropna().index)
             )
             if len(idx) >= 20:
-                pool[t] = (F.loc[idx], L.loc[idx])
+                pool[t] = (F.loc[idx], L.loc[idx], L2.reindex(idx))
 
-    rows        = {"dpr": {}, "ret": {}, "srp": {}}
+    rows        = {"dpr": {}, "ret": {}, "srp": {}, "ret2": {}}
+    phi_list    = []          # cross-sectional corr(μ¹, μ²): alpha-persistence diagnostic
     model_store = {}
     pred_years  = sorted({rets.index[t].year for t in range(first_pred, T - 1)})
 
@@ -994,14 +1027,26 @@ def _generate_all_dm_weights(
                     X_tr_s, y_tr_s, eval_set=[(X_va_s, y_va_s)], verbose=False
                 )
                 models.append(m)
-            model_store[year] = (models, mu_k, sigma2_k)
+
+            # t+2 horizon ensemble: SAME features, label = decile of r_{t+1} (multi-horizon).
+            y2_tr = pd.concat([pool[t][2] for t in tr_ts_s if t in pool])
+            y2_va = pd.concat([pool[t][2] for t in va_ts_s if t in pool])
+            m2tr, m2va = y2_tr.notna().values, y2_va.notna().values
+            models2 = []
+            for seed in range(n_seeds):
+                m = XGBClassifier(**XGB_PARAMS, random_state=seed).fit(
+                    X_tr_s[m2tr], y2_tr[m2tr].astype(int),
+                    eval_set=[(X_va_s[m2va], y2_va[m2va].astype(int))], verbose=False
+                )
+                models2.append(m)
+            model_store[year] = (models, models2, mu_k, sigma2_k)
 
         elif model_store:
             model_store[year] = list(model_store.values())[-1]
         else:
             continue
 
-        mdls, mu_k, sigma2_k = model_store[year]
+        mdls, mdls2, mu_k, sigma2_k = model_store[year]
 
         for t in months:
             if t not in pool:
@@ -1010,8 +1055,16 @@ def _generate_all_dm_weights(
             if len(F) < 20:
                 continue
             signal_date = rets.index[t - 1]
-            probs       = np.mean([m.predict_proba(F) for m in mdls], axis=0)
+            probs       = np.mean([m.predict_proba(F) for m in mdls],  axis=0)
+            probs2      = np.mean([m.predict_proba(F) for m in mdls2], axis=0)
 
+            mu_i  = probs  @ mu_k     # E[r_{t}]   (t+1-horizon expected return)
+            mu_i2 = probs2 @ mu_k     # E[r_{t+1}] (t+2-horizon expected return)
+            # term-structure correlation = alpha persistence (sets optimal trade rate)
+            if np.std(mu_i) > 0 and np.std(mu_i2) > 0:
+                phi_list.append(float(np.corrcoef(mu_i, mu_i2)[0, 1]))
+
+            # Standard single-horizon DM scores
             for name, sc in [
                 ("dpr", score_dpr(probs)),
                 ("ret", score_ret(probs, mu_k)),
@@ -1024,6 +1077,20 @@ def _generate_all_dm_weights(
                 if portfolio == "ls":
                     w[s_ser.nsmallest(n).index] = -1.0 / n
                 rows[name][signal_date] = w
+
+            # ret2: multi-horizon expected-return score μ¹+μ² — holds names whose
+            # edge PERSISTS across both horizons → fewer boundary crossings → lower turnover.
+            s2 = pd.Series(mu_i + mu_i2, index=F.index)
+            n2 = max(1, int(len(s2) * q))
+            w2 = pd.Series(0.0, index=F.index)
+            w2[s2.nlargest(n2).index] = +1.0 / n2
+            if portfolio == "ls":
+                w2[s2.nsmallest(n2).index] = -1.0 / n2
+            rows["ret2"][signal_date] = w2
+
+    if phi_list:
+        print(f"\n  [multi-horizon] mean corr(μ¹, μ²) φ = {np.mean(phi_list):+.3f}  "
+              f"(alpha persistence; high → t+1 signal survives to t+2)")
 
     out = {}
     for name, weight_rows in rows.items():
@@ -1049,6 +1116,37 @@ def _weights_to_daily(weights: pd.DataFrame, prices_daily: pd.DataFrame) -> tupl
     w.index = pd.DatetimeIndex(mapped_index)
     w = w[~w.index.duplicated(keep="last")]
     return w, mapped_index
+
+
+def apply_partial_adjustment(
+    weights: pd.DataFrame, delta: float = 0.5, gross: float = 2.0
+) -> pd.DataFrame:
+    """
+    Gârleanu–Pedersen partial adjustment (quadratic-cost-optimal turnover control).
+
+    Optimal policy under quadratic (market-impact) costs is to trade only a
+    fraction of the gap toward the target each period:
+        w~_t = (1 - delta) * w~_{t-1} + delta * w*_t
+    then renormalize the row to constant gross exposure (sum|w| = gross), which
+    preserves dollar-neutrality (both inputs are net-zero → scaled combo is net-zero).
+
+    delta in (0,1]:  1 = trade fully to target (= original strategy);
+                     smaller delta = slower adjustment = lower turnover, mild alpha decay.
+    The GP closed form sets delta from the cost/risk ratio:
+        lambda*delta^2 + gamma*Sigma*delta - gamma*Sigma = 0.
+    Here delta is exposed as a tunable knob (default 0.5 ≈ trade halfway each month).
+    """
+    cols   = weights.columns
+    out    = {}
+    w_prev = pd.Series(0.0, index=cols)
+    for date, w_target in weights.iterrows():
+        w = (1.0 - delta) * w_prev + delta * w_target
+        s = w.abs().sum()
+        if s > 0:
+            w = w * (gross / s)          # hold gross constant; net-zero preserved
+        out[date]  = w
+        w_prev     = w
+    return pd.DataFrame(out).T.reindex(columns=cols).fillna(0.0)
 
 
 def _monthly_ls_backtest(
@@ -1171,12 +1269,14 @@ def compare_strategies(
         portfolio="ls",
     )
 
-    # ── 3. DM weights (raw momentum features) ────────────────────────────────
-    print("\n── Deep Momentum L/S ────────────────────────────────────────────────")
+    # ── 3. DM weights (momentum + dynamics + FFD features) ───────────────────
+    # use_ffd=True: optimal d frozen on the initial training window, causal filter
+    # → FFD features added with no OOS look-ahead.
+    print("\n── Deep Momentum L/S (+ FFD) ────────────────────────────────────────")
     dm_w = _generate_all_dm_weights(
         rets_monthly, size_monthly, prices_monthly,
         min_train_months=min_train_months, max_train_months=max_train_months,
-        q=q, n_seeds=n_seeds, use_ffd=False,
+        q=q, n_seeds=n_seeds, use_ffd=True,
         portfolio="ls", pool=None,
     )
 
@@ -1200,11 +1300,18 @@ def compare_strategies(
     all_results = {}
     oos_start_ref = None
 
+    # Champion (RET+GP) vs the multi-horizon t+2 variant:
+    #   DM-RET         equal-weight decile L/S (best single-horizon criterion)
+    #   DM-RET+GP      champion: GP partial adjustment (delta=0.5)
+    #   DM-RET2+GP     multi-horizon score μ¹+μ² + GP partial adjustment
+    dm_ret      = dm_w["ret"]
+    dm_ret_gp   = apply_partial_adjustment(dm_ret,        delta=0.5)
+    dm_ret2_gp  = apply_partial_adjustment(dm_w["ret2"],  delta=0.5)
     for label, raw_w in [
-        ("Bench zMOM12 L/S",  bench_w),
-        ("DM-DPR L/S",        dm_w["dpr"]),
-        ("DM-RET L/S",        dm_w["ret"]),
-        ("DM-SRP L/S",        dm_w["srp"]),
+        ("Bench zMOM12 L/S",  bench_w),       # raw momentum benchmark
+        ("DM-RET L/S",        dm_ret),        # best single-horizon DM criterion
+        ("DM-RET+GP L/S",     dm_ret_gp),     # champion: + GP turnover control
+        ("DM-RET2+GP L/S",    dm_ret2_gp),    # multi-horizon (t+1 & t+2) + GP
     ]:
         oos_start = raw_w.index[0]
         if oos_start_ref is None:
