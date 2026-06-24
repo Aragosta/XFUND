@@ -548,13 +548,19 @@ def load_broad_universe_tiingo(
 
 
 def _save_tiingo_checkpoint(done: dict, checkpoint_path: str) -> None:
-    """Write downloaded ticker data to a parquet checkpoint file."""
+    """Atomically write checkpoint: write to .tmp then rename so a crash never corrupts."""
+    import os
+    tmp = checkpoint_path + ".tmp"
     try:
         close_df  = pd.DataFrame({t: done[t]["adjClose"]  for t in done})
         volume_df = pd.DataFrame({t: done[t]["adjVolume"] for t in done})
-        pd.concat({"close": close_df, "volume": volume_df}, axis=1).to_parquet(checkpoint_path)
+        pd.concat({"close": close_df, "volume": volume_df}, axis=1).to_parquet(tmp)
+        os.replace(tmp, checkpoint_path)
     except Exception:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 # ── Archive data loader & BACKTEST.py integration ────────────────────────────
