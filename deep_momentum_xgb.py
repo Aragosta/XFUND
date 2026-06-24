@@ -8,10 +8,9 @@ Two-step approach:
      out the bimodality-driven crash tail of momentum strategies.
 
 Usage:
-    python deep_momentum_xgb.py                   # synthetic data
-    python deep_momentum_xgb.py sp500_stocks.csv  # Kaggle S&P 500 format
-                                                  # (columns: date,open,high,
-                                                  #  low,close,volume,Name)
+    python deep_momentum_xgb.py                        # synthetic data
+    python deep_momentum_xgb.py --compare-tiingo       # Tiingo broad universe
+    python deep_momentum_xgb.py sp500_stocks.csv srp   # CSV archive
 """
 import sys
 import warnings
@@ -336,451 +335,6 @@ def backtest(csv_path=None):
         print()
 
     return results
-
-
-# ── yfinance S&P 500 dataloader ───────────────────────────────────────────────
-
-def load_sp500_yfinance(
-    years: int = 12,
-    cache_path: str | None = "sp500_yf_cache.parquet",
-    min_coverage: float = 0.80,
-    verbose: bool = True,
-) -> tuple:
-    """
-    Download S&P 500 constituents from Wikipedia and fetch daily Adj Close +
-    Volume from Yahoo Finance.  Returns the same tuple as ``load_sp500_archive``.
-
-    Parameters
-    ----------
-    years          : history length in years (≥ 10 recommended for the paper)
-    cache_path     : parquet file to cache raw downloads (None = no cache)
-    min_coverage   : drop tickers with fewer than this fraction of non-NaN days
-    verbose        : print progress
-
-    Returns
-    -------
-    prices_daily   : pd.DataFrame  daily adj-close     (T_daily × N)
-    rets_monthly   : pd.DataFrame  monthly returns ±50% (T_monthly × N)
-    size_monthly   : pd.DataFrame  Close×Volume proxy   (T_monthly × N)
-    """
-    try:
-        import yfinance as yf
-    except ImportError:
-        raise ImportError("yfinance is required: pip install yfinance")
-
-    end   = pd.Timestamp.today().normalize()
-    start = end - pd.DateOffset(years=years)
-
-    # ── 1. Hardcoded list of ~450 established S&P 500 names (10 + yr history) ─
-    tickers = [
-        # Information Technology
-        "AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD", "INTC", "CSCO",
-        "QCOM", "TXN", "NOW", "INTU", "IBM", "MU", "AMAT", "LRCX", "KLAC", "ADI",
-        "MCHP", "SNPS", "CDNS", "ANSS", "FTNT", "TER", "KEYS", "VRSN", "AKAM", "CTSH",
-        "IT", "FFIV", "NTAP", "STX", "WDC", "HPE", "HPQ", "NXPI", "ON", "SWKS",
-        "MPWR", "TEL", "ZBRA", "JNPR", "CDW", "ENPH", "GDDY", "ROP", "EPAM",
-        # Communication Services
-        "GOOGL", "GOOG", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS", "CHTR",
-        "FOX", "FOXA", "NWS", "NWSA", "IPG", "OMC", "LYV", "EA", "TTWO",
-        # Consumer Discretionary
-        "AMZN", "TSLA", "HD", "MCD", "NKE", "LOW", "SBUX", "TJX", "BKNG", "MAR",
-        "HLT", "GM", "F", "ORLY", "AZO", "ROST", "YUM", "DG", "DLTR", "DHI",
-        "LEN", "PHM", "NVR", "TOL", "EXPE", "MGM", "HAS", "BBY", "KMX", "AN",
-        "VFC", "RL", "ULTA", "GPC", "AAP", "BWA", "APTV", "MHK", "GRMN", "PVH",
-        "TPR", "DECK", "POOL", "CPRI", "HBI", "CRI", "PNR", "LKQ", "NKE", "WYNN",
-        "LVS", "RCL", "CCL", "NCLH", "MAT",
-        # Consumer Staples
-        "PG", "KO", "PEP", "WMT", "COST", "MDLZ", "PM", "MO", "KHC", "CL",
-        "KMB", "CHD", "CLX", "SJM", "CAG", "CPB", "HRL", "MKC", "GIS", "K",
-        "HSY", "MNST", "TAP", "STZ", "EL", "SPB", "HELE", "SYY", "KR", "ADM",
-        "BG", "TSN", "HRL", "INGR",
-        # Health Care
-        "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "ABT", "TMO", "DHR", "AMGN",
-        "BMY", "ISRG", "SYK", "MDT", "BSX", "EW", "BDX", "IDXX", "IQV", "DGX",
-        "LH", "CVS", "CI", "HUM", "MOH", "CNC", "ELV", "CAH", "MCK", "ABC",
-        "HSIC", "ZBH", "RMD", "HOLX", "PODD", "ALGN", "TFX", "VRTX", "REGN",
-        "BIIB", "GILD", "ILMN", "A", "BAX", "ZTS", "VTRS", "CTLT", "MTD",
-        "WAT", "PKI", "TECH", "PRGO", "HCA", "DVA", "AMED", "STE", "HAH",
-        "INCY", "ALXN", "JAZZ",
-        # Financials
-        "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "AXP", "V",
-        "MA", "COF", "USB", "PNC", "TFC", "BK", "STT", "SPGI", "MCO", "ICE",
-        "CME", "CBOE", "NDAQ", "MSCI", "FDS", "BR", "BEN", "IVZ", "TROW", "AMG",
-        "BX", "CG", "RJF", "MET", "PRU", "PGR", "TRV", "AIG", "ALL",
-        "CB", "HIG", "AON", "MMC", "WRB", "RE", "GL", "L", "CINF", "AMP",
-        "AFL", "FITB", "HBAN", "KEY", "RF", "CFG", "MTB", "ZION",
-        "SYF", "DFS", "ALLY", "OMF", "NDAQ", "FNF", "FAF", "RLI", "WTW",
-        # Energy
-        "XOM", "CVX", "COP", "EOG", "SLB", "MPC", "PSX", "VLO", "HES", "OXY",
-        "DVN", "FANG", "BKR", "HAL", "NOV", "OKE", "WMB", "KMI", "MRO", "APA",
-        "EQT", "LNG", "TRGP", "CVI", "PXD", "HFC",
-        # Industrials
-        "GE", "HON", "BA", "CAT", "RTX", "LMT", "NOC", "GD", "TDG", "HII",
-        "LHX", "TXT", "CARR", "OTIS", "EMR", "ROK", "IR", "ITW", "PH", "MMM",
-        "DOV", "FTV", "XYL", "GNRC", "AOS", "AME", "TT", "JCI", "ETN", "EFX",
-        "VRSK", "CTAS", "CPRT", "FAST", "GWW", "IEX", "IDEX",
-        "CHRW", "EXPD", "NSC", "UNP", "CSX", "JBHT", "ODFL", "UPS", "FDX",
-        "ALLE", "PWR", "PCAR", "DE", "CMI", "AGCO", "WM", "RSG", "SAIC",
-        "J", "LDOS", "URI", "NDSN", "MIDD", "MAS", "SWK", "PNR", "HUBB",
-        "ROL", "CACI", "CLVT", "ACM", "FLR", "MTZ", "PWR", "BLDR",
-        # Materials
-        "LIN", "APD", "ECL", "SHW", "PPG", "NEM", "FCX", "NUE", "STLD", "RS",
-        "VMC", "MLM", "FMC", "MOS", "CF", "IFF", "RPM", "SEE", "BLL", "AVY",
-        "IP", "WRK", "PKG", "ALB", "DD", "DOW", "LYB", "CE", "EMN", "HUN",
-        "OLN", "TREX", "ATI",
-        # Real Estate
-        "PLD", "AMT", "EQIX", "CCI", "SPG", "O", "DLR", "PSA", "EXR", "CUBE",
-        "SBAC", "BXP", "VTR", "WELL", "ARE", "EQR", "UDR", "AVB", "ESS", "MAA",
-        "NNN", "ADC", "SUI", "ELS", "AMH", "INVH", "REXR", "FR", "EGP", "COLD",
-        "STAG", "IRM", "WY", "HST",
-        # Utilities
-        "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "ED", "ES",
-        "WEC", "ETR", "PPL", "FE", "AES", "NI", "CMS", "CNP", "LNT", "EVRG",
-        "PNW", "EIX", "PEG", "AWK", "AWR", "SJW",
-    ]
-
-    if verbose:
-        print(f"[yf] {len(tickers)} S&P 500 tickers  |  {start.date()} – {end.date()}")
-
-    # ── 2. Load from cache or download ───────────────────────────────────────
-    import os
-
-    need_download = True
-    close_wide = volume_wide = None
-
-    if cache_path and os.path.exists(cache_path):
-        try:
-            cached = pd.read_parquet(cache_path)
-            # Cache stores close and volume stacked: first level = metric
-            if "close" in cached.columns.get_level_values(0) and \
-               "volume" in cached.columns.get_level_values(0):
-                close_wide  = cached["close"]
-                volume_wide = cached["volume"]
-                cache_start = close_wide.index[0]
-                cache_end   = close_wide.index[-1]
-                if cache_start <= start and cache_end >= end - pd.Timedelta(days=5):
-                    need_download = False
-                    if verbose:
-                        print(f"[yf] cache hit: {cache_path}  ({cache_start.date()} – {cache_end.date()})")
-        except Exception:
-            pass   # corrupt cache → re-download
-
-    if need_download:
-        if verbose:
-            print(f"[yf] downloading {len(tickers)} tickers …")
-
-        raw = yf.download(
-            tickers,
-            start=start.strftime("%Y-%m-%d"),
-            end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-            auto_adjust=True,
-            progress=verbose,
-            threads=True,
-        )
-
-        # yfinance returns MultiIndex (metric, ticker) columns
-        if isinstance(raw.columns, pd.MultiIndex):
-            close_wide  = raw["Close"].copy()
-            volume_wide = raw["Volume"].copy()
-        else:
-            # Single-ticker fallback (shouldn't happen for a list)
-            close_wide  = raw[["Close"]].copy()
-            volume_wide = raw[["Volume"]].copy()
-
-        close_wide.index  = pd.to_datetime(close_wide.index)
-        volume_wide.index = pd.to_datetime(volume_wide.index)
-
-        if cache_path:
-            try:
-                combined = pd.concat(
-                    {"close": close_wide, "volume": volume_wide}, axis=1
-                )
-                combined.to_parquet(cache_path)
-                if verbose:
-                    print(f"[yf] saved cache → {cache_path}")
-            except Exception as e:
-                if verbose:
-                    print(f"[yf] cache write failed (continuing): {e}")
-
-    # ── 3. Quality filter ────────────────────────────────────────────────────
-    n_days      = len(close_wide)
-    good        = close_wide.notna().mean() >= min_coverage
-    close_wide  = close_wide.loc[:, good]
-    volume_wide = volume_wide.loc[:, good]
-
-    if verbose:
-        print(
-            f"[yf] kept {good.sum()}/{len(good)} tickers "
-            f"(≥{min_coverage:.0%} coverage)  |  {n_days} trading days"
-        )
-
-    # ── 4. Build monthly returns & size proxy ────────────────────────────────
-    prices_daily    = close_wide.sort_index()
-    prices_monthly  = prices_daily.resample("ME").last()
-    volume_monthly  = volume_wide.resample("ME").last()
-
-    rets_monthly    = prices_monthly.pct_change().clip(-0.5, 0.5)
-    size_monthly    = (prices_monthly * volume_monthly).ffill()
-
-    if verbose:
-        print(
-            f"[yf] daily prices : {prices_daily.shape}  "
-            f"({prices_daily.index[0].date()} – {prices_daily.index[-1].date()})"
-        )
-        print(
-            f"[yf] monthly rets : {rets_monthly.shape}  "
-            f"({rets_monthly.index[0].date()} – {rets_monthly.index[-1].date()})"
-        )
-
-    return prices_daily, rets_monthly, size_monthly
-
-
-def run_with_yfinance(
-    *,
-    years: int = 12,
-    strategy: str = "srp",
-    portfolio: str = "ls",
-    q: float = TOP_Q,
-    min_train_months: int = MIN_TRAIN_YRS * 12,
-    transaction_cost: float = 0.001,
-    freq: int = 252,
-    lag: int = 1,
-    n_seeds: int = N_SEEDS,
-    cache_path: str | None = "sp500_yf_cache.parquet",
-) -> dict:
-    """
-    Full pipeline using yfinance S&P 500 data:
-        download  →  generate DM weights  →  call BACKTEST.backtest()
-
-    Parameters mirror ``run_with_backtest`` except data comes from yfinance.
-    """
-    try:
-        import BACKTEST
-    except ImportError:
-        raise ImportError("BACKTEST.py not found in the same directory.")
-
-    # 1. Download data
-    prices_daily, rets_monthly, size_monthly = load_sp500_yfinance(
-        years=years, cache_path=cache_path
-    )
-
-    # 2. Generate DM weights
-    print(f"\nGenerating DM-{strategy.upper()} {portfolio.upper()} weights …")
-    weights = generate_dm_weights(
-        rets_monthly, size_monthly,
-        strategy=strategy, portfolio=portfolio,
-        q=q, min_train_months=min_train_months,
-        n_seeds=n_seeds,
-    )
-
-    # 3. Map monthly signal dates → nearest prior trading day
-    daily_idx    = prices_daily.index
-    mapped_index = []
-    for d in weights.index:
-        prior = daily_idx[daily_idx <= d]
-        if len(prior):
-            mapped_index.append(prior[-1])
-
-    weights_mapped = weights.copy()
-    weights_mapped.index = pd.DatetimeIndex(mapped_index)
-    weights_mapped = weights_mapped[~weights_mapped.index.duplicated(keep="last")]
-
-    signal_dates = mapped_index
-
-    # 4. Restrict to common tickers / OOS window
-    common_tickers = weights_mapped.columns.intersection(prices_daily.columns).tolist()
-    oos_start      = signal_dates[0]
-    prices_oos     = prices_daily.loc[oos_start:, common_tickers]
-    weights_oos    = weights_mapped.reindex(columns=common_tickers).fillna(0.0)
-
-    print(
-        f"\n[backtest] OOS window : {oos_start.date()} – {prices_oos.index[-1].date()}"
-        f"  ({len(prices_oos)} trading days,  {len(signal_dates)} rebalances)"
-    )
-    print(f"[backtest] Universe   : {len(common_tickers)} tickers")
-
-    # 5. Run backtest
-    result = BACKTEST.backtest(
-        weights=weights_oos,
-        prices=prices_oos,
-        freq=freq,
-        lag=lag,
-        transaction_cost=transaction_cost,
-        signal_dates=signal_dates,
-        compute_risk_metrics=False,
-    )
-
-    # 6. Print summary
-    print(f"\n── DM-{strategy.upper()} {portfolio.upper()} (yfinance {years}y) {'─'*28}")
-    print(f"  Annual Return  : {result['ann_return']:>8.2%}")
-    print(f"  Annual Vol     : {result['ann_vol']:>8.2%}")
-    print(f"  Sharpe Ratio   : {result['sharpe']:>8.3f}")
-    print(f"  Max Drawdown   : {result['max_drawdown']:>8.2%}")
-    print(f"  Total Return   : {result['total_return']:>8.2%}")
-    print(f"  Ann. Turnover  : {result['ann_turnover']:>8.2%}")
-
-    return result
-
-
-def load_broad_universe_yfinance(
-    years: int = 12,
-    n_stocks: int = 1500,
-    min_market_cap: int = 200_000_000,
-    min_price: float = 5.0,
-    min_coverage: float = 0.80,
-    cache_path: str | None = "broad_universe_yf_cache.parquet",
-    verbose: bool = True,
-) -> tuple:
-    """
-    Build a broad US equity universe using the yfinance screener.
-
-    Fetches the top `n_stocks` US common stocks (NYSE + NASDAQ) sorted by
-    current market cap, then downloads price/volume history via yfinance.
-    Covers the full size spectrum (large/mid/small cap) needed for the
-    bimodal return distribution described in Han (2022).
-
-    Returns
-    -------
-    prices_daily  : pd.DataFrame  daily adj-close   (T_daily × N)
-    rets_monthly  : pd.DataFrame  monthly returns    (T_monthly × N)
-    size_monthly  : pd.DataFrame  Close×Volume proxy (T_monthly × N)
-    """
-    try:
-        import yfinance as yf
-        from yfinance import screen, EquityQuery
-    except ImportError:
-        raise ImportError("yfinance >= 0.2.x required: pip install --upgrade yfinance")
-
-    import os
-
-    end   = pd.Timestamp.today().normalize()
-    start = end - pd.DateOffset(years=years)
-
-    # ── 1. Cache check ────────────────────────────────────────────────────────
-    if cache_path and os.path.exists(cache_path):
-        try:
-            cached = pd.read_parquet(cache_path)
-            if ("close" in cached.columns.get_level_values(0) and
-                    "volume" in cached.columns.get_level_values(0)):
-                close_wide  = cached["close"]
-                volume_wide = cached["volume"]
-                if (close_wide.index[0] <= start and
-                        close_wide.index[-1] >= end - pd.Timedelta(days=5)):
-                    if verbose:
-                        print(f"[yf] cache hit: {cache_path}  "
-                              f"({close_wide.index[0].date()} – {close_wide.index[-1].date()})")
-                    prices_daily   = close_wide.sort_index()
-                    prices_monthly = prices_daily.resample("ME").last()
-                    volume_monthly = volume_wide.resample("ME").last()
-                    rets_monthly   = prices_monthly.pct_change().clip(-0.5, 0.5)
-                    size_monthly   = (prices_monthly * volume_monthly).ffill()
-                    if verbose:
-                        print(f"[yf] {prices_daily.shape[1]} tickers  |  "
-                              f"{prices_daily.index[0].date()} – {prices_daily.index[-1].date()}")
-                        print(f"[yf] monthly rets : {rets_monthly.shape}  "
-                              f"({rets_monthly.index[0].date()} – {rets_monthly.index[-1].date()})")
-                    return prices_daily, rets_monthly, size_monthly
-        except Exception:
-            pass
-
-    # ── 2. Screener: top n_stocks US equities by market cap ───────────────────
-    q = EquityQuery('and', [
-        EquityQuery('eq',    ['region', 'us']),
-        EquityQuery('is-in', ['exchange', 'NMS', 'NYQ']),
-        EquityQuery('gte',   ['intradayprice', min_price]),
-        EquityQuery('gte',   ['intradaymarketcap', min_market_cap]),
-    ])
-
-    if verbose:
-        print(f"[yf] screener → top {n_stocks} US equities "
-              f"(NYSE+NASDAQ, price≥${min_price:.0f}, mktcap≥${min_market_cap/1e6:.0f}M) …")
-
-    tickers: list[str] = []
-    seen: set[str] = set()
-    offset = 0
-    total = n_stocks + 1
-    while len(tickers) < n_stocks and offset < total:
-        result = screen(q, size=250, offset=offset,
-                        sortField='intradaymarketcap', sortAsc=False)
-        total = result.get('total', 0)
-        for qt in result.get('quotes', []):
-            sym = qt.get('symbol', '')
-            if sym and sym not in seen and qt.get('quoteType') == 'EQUITY':
-                seen.add(sym)
-                tickers.append(sym)
-        offset += 250
-
-    tickers = tickers[:n_stocks]
-    if verbose:
-        print(f"[yf] {len(tickers)} tickers from screener")
-
-    # ── 3. Download in batches of 200 ─────────────────────────────────────────
-    BATCH = 200
-    n_batches = -(-len(tickers) // BATCH)
-    all_close: list[pd.DataFrame] = []
-    all_vol:   list[pd.DataFrame] = []
-
-    for i in range(0, len(tickers), BATCH):
-        batch = tickers[i : i + BATCH]
-        if verbose:
-            print(f"[yf] batch {i // BATCH + 1}/{n_batches}  ({len(batch)} tickers) …")
-        raw = yf.download(
-            batch,
-            start=start.strftime("%Y-%m-%d"),
-            end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-        if raw.empty:
-            continue
-        if isinstance(raw.columns, pd.MultiIndex):
-            all_close.append(raw["Close"])
-            all_vol.append(raw["Volume"])
-        else:
-            all_close.append(raw[["Close"]].rename(columns={"Close": batch[0]}))
-            all_vol.append(raw[["Volume"]].rename(columns={"Volume": batch[0]}))
-
-    if not all_close:
-        raise RuntimeError("[yf] no data downloaded — check network / tickers")
-
-    close_wide  = pd.concat(all_close, axis=1)
-    volume_wide = pd.concat(all_vol,   axis=1)
-    close_wide.index  = pd.to_datetime(close_wide.index)
-    volume_wide.index = pd.to_datetime(volume_wide.index)
-
-    # ── 4. Cache ──────────────────────────────────────────────────────────────
-    if cache_path:
-        try:
-            pd.concat({"close": close_wide, "volume": volume_wide}, axis=1).to_parquet(cache_path)
-            if verbose:
-                print(f"[yf] saved cache → {cache_path}")
-        except Exception as e:
-            if verbose:
-                print(f"[yf] cache write failed (continuing): {e}")
-
-    # ── 5. Quality filter ─────────────────────────────────────────────────────
-    good        = close_wide.notna().mean() >= min_coverage
-    close_wide  = close_wide.loc[:, good]
-    volume_wide = volume_wide.loc[:, good]
-    if verbose:
-        print(f"[yf] kept {good.sum()}/{len(good)} tickers "
-              f"(≥{min_coverage:.0%} coverage)  |  {len(close_wide)} trading days")
-
-    # ── 6. Monthly aggregation ────────────────────────────────────────────────
-    prices_daily   = close_wide.sort_index()
-    prices_monthly = prices_daily.resample("ME").last()
-    volume_monthly = volume_wide.resample("ME").last()
-    rets_monthly   = prices_monthly.pct_change().clip(-0.5, 0.5)
-    size_monthly   = (prices_monthly * volume_monthly).ffill()
-
-    if verbose:
-        print(f"[yf] daily prices : {prices_daily.shape}  "
-              f"({prices_daily.index[0].date()} – {prices_daily.index[-1].date()})")
-        print(f"[yf] monthly rets : {rets_monthly.shape}  "
-              f"({rets_monthly.index[0].date()} – {rets_monthly.index[-1].date()})")
-
-    return prices_daily, rets_monthly, size_monthly
 
 
 def load_broad_universe_tiingo(
@@ -1604,30 +1158,22 @@ def _monthly_ls_backtest(
     }
 
 
-def compare_strategies_yfinance(
+def compare_strategies(
+    preloaded: tuple,
     *,
-    years: int = 12,
     n_seeds: int = N_SEEDS,
-    min_train_months: int = 60,   # 5-year warmup → ~6 yr OOS from 12 yr data
+    min_train_months: int = MIN_TRAIN_YRS * 12,
     q: float = TOP_Q,
     transaction_cost: float = 0.001,
-    freq: int = 252,
-    lag: int = 1,
-    cache_path: str | None = None,
-    save_fig: str = "dm_comparison.png",
-    universe: str = "sp500",      # "sp500" | "broad" | "tiingo"
-    _preloaded: tuple | None = None,   # (prices_monthly, rets_monthly, size_monthly)
+    save_fig: str = "dm_comparison_tiingo.png",
 ) -> dict:
     """
-    Run Bench (zMOM12), DM-DPR, DM-RET, DM-SRP long/short plus S&P 500 B&H (SPY),
-    then display a unified comparison via ``BACKTEST.results_backtest()``.
-
-    XGBoost models are trained **once** and shared across all three DM strategies.
-
-    Returns dict  label → BACKTEST result dict.
+    Run Bench (FFD-zMOM12), DM-DPR, DM-RET, DM-SRP L/S plus SPY B&H.
+    preloaded : (prices_monthly, rets_monthly, size_monthly) from load_broad_universe_tiingo()
+    Returns dict  label → backtest result dict.
     """
     import matplotlib
-    matplotlib.use("Agg")   # no display needed; figure is saved to file
+    matplotlib.use("Agg")
 
     try:
         import BACKTEST
@@ -1635,21 +1181,10 @@ def compare_strategies_yfinance(
     except ImportError as e:
         raise ImportError(str(e))
 
-    # ── 1. Load universe ─────────────────────────────────────────────────────
-    if _preloaded is not None:
-        prices_monthly, rets_monthly, size_monthly = _preloaded
-    elif universe == "broad":
-        _cache = cache_path or "broad_universe_yf_cache.parquet"
-        prices_daily, rets_monthly, size_monthly = load_broad_universe_yfinance(
-            years=years, cache_path=_cache
-        )
-        prices_monthly = prices_daily.resample("ME").last()
-    else:
-        _cache = cache_path or "sp500_yf_cache.parquet"
-        prices_daily, rets_monthly, size_monthly = load_sp500_yfinance(
-            years=years, cache_path=_cache
-        )
-        prices_monthly = prices_daily.resample("ME").last()
+    # ── 1. Unpack preloaded Tiingo data ───────────────────────────────────────
+    prices_monthly, rets_monthly, size_monthly = preloaded
+    data_start = rets_monthly.index[0]
+    data_end   = rets_monthly.index[-1]
 
 
     # ── 2. Bench weights — FFD d found inside on training window (no leakage) ─
@@ -1669,8 +1204,8 @@ def compare_strategies_yfinance(
     # ── 4. SPY download ──────────────────────────────────────────────────────
     spy_raw = yf.download(
         "SPY",
-        start=prices_daily.index[0].strftime("%Y-%m-%d"),
-        end=(prices_daily.index[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        start=data_start.strftime("%Y-%m-%d"),
+        end=(data_end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
         auto_adjust=True, progress=False,
     )
     # yfinance may return MultiIndex (metric, ticker) or flat columns depending on version
@@ -1770,43 +1305,13 @@ if __name__ == "__main__":
     import os
     args = sys.argv[1:]
 
-    if args and args[0] == "--compare":
-        # Full comparison: python deep_momentum_xgb.py --compare [years] [n_seeds]
-        yrs    = int(args[1]) if len(args) > 1 else 12
-        seeds  = int(args[2]) if len(args) > 2 else N_SEEDS
-        compare_strategies_yfinance(years=yrs, n_seeds=seeds)
-
-    elif args and args[0] == "--compare-broad":
-        # Broad universe: python deep_momentum_xgb.py --compare-broad [years] [n_seeds]
-        yrs    = int(args[1]) if len(args) > 1 else 12
-        seeds  = int(args[2]) if len(args) > 2 else N_SEEDS
-        compare_strategies_yfinance(years=yrs, n_seeds=seeds, universe="broad",
-                                    save_fig="dm_comparison_broad.png")
-
-    elif args and args[0] == "--compare-tiingo":
-        # Tiingo universe: python deep_momentum_xgb.py --compare-tiingo [start_year] [n_seeds]
+    if args and args[0] == "--compare-tiingo":
+        # python deep_momentum_xgb.py --compare-tiingo [start_date] [n_seeds]
         start_yr = args[1] if len(args) > 1 else "2000-01-01"
         seeds    = int(args[2]) if len(args) > 2 else N_SEEDS
         print(f"\n[tiingo] Loading broad universe (start={start_yr}, seeds={seeds}) …")
-        prices_monthly, rets_monthly, size_monthly = load_broad_universe_tiingo(
-            start_date=start_yr,
-        )
-        compare_strategies_yfinance(
-            years=int((pd.Timestamp.today() - pd.Timestamp(start_yr)).days / 365.25),
-            n_seeds=seeds,
-            universe="tiingo",
-            save_fig="dm_comparison_tiingo.png",
-            _preloaded=(prices_monthly, rets_monthly, size_monthly),
-        )
-
-    elif args and args[0] == "--yfinance":
-        # yfinance pipeline: python deep_momentum_xgb.py --yfinance [years] [strategy] [portfolio] [n_seeds]
-        yf_args = args[1:]
-        yrs   = int(yf_args[0])   if len(yf_args) > 0 else 12
-        strat = yf_args[1]        if len(yf_args) > 1 else "srp"
-        port  = yf_args[2]        if len(yf_args) > 2 else "ls"
-        seeds = int(yf_args[3])   if len(yf_args) > 3 else N_SEEDS
-        run_with_yfinance(years=yrs, strategy=strat, portfolio=port, n_seeds=seeds)
+        data = load_broad_universe_tiingo(start_date=start_yr)
+        compare_strategies(data, n_seeds=seeds)
 
     elif args and os.path.isfile(args[0]) and args[0].endswith(".csv"):
         # CSV archive pipeline: python deep_momentum_xgb.py all_stocks_5yr.csv srp ls
