@@ -24,14 +24,20 @@ warnings.filterwarnings("ignore")
 MOM_WINDOWS   = [1, 3, 6, 9, 12]   # momentum lookback months
 N_SEEDS       = 20                  # ensemble size (paper uses 50-100; 20 balances speed vs. stability)
 MIN_TRAIN_YRS = 10                  # minimum training history before first pred
-TOP_Q         = 0.10                # long / short decile size
+TOP_Q         = 0.05                # long / short tail size (paper: edge concentrates in outer 5%)
 
 # Paper: "default hyperparameters, except for early stopping"
 XGB_PARAMS = dict(
     num_class=10,
     objective="multi:softprob",
     eval_metric="mlogloss",
-    early_stopping_rounds=20,
+    n_estimators=300,
+    max_depth=3,
+    learning_rate=0.10,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_lambda=1.0,
+    early_stopping_rounds=30,
     verbosity=0,
 )
 
@@ -80,10 +86,10 @@ def make_features(
     ffd_scores: dict | None = None,
 ) -> pd.DataFrame:
     """
-    Build (N_stocks × 16) feature matrix at time index t.  Matches Han & Qin (2026) Table 1.
+    Build (N_stocks × 20) feature matrix at time index t.  Matches Han & Qin (2022) Table 1.
 
-    16 features = 5 zMOM + 5 MMOM + 5 sMOM + 1 SIZE (categorical 1-10).
-    In FFD mode: zFFD / MFFD / sFFD replace the raw momentum signals.
+    20 features = 5 nMOM + 5 MMOM + 10 SIZE dummies (MOM-SZ-NOM spec).
+    sMOM is NOT a feature — std is used only to normalize, per paper Sec. 3.2.3.
     """
     feats = {}
 
@@ -95,24 +101,23 @@ def make_features(
             sigma = row.std()
             feats[f"zFFD{m}"] = (row - mu) / (sigma + 1e-10)
             feats[f"MFFD{m}"] = mu
-            feats[f"sFFD{m}"] = sigma
     else:
-        # ── Raw cumulative-return mode ─────────────────────────────────────────
+        # ── Raw cumulative-return mode (paper Eq. 6–8) ────────────────────────
         for m in MOM_WINDOWS:
             if m == 1:
                 mom = rets.iloc[t - 1]
             else:
-                # prod from t-m+1 to t-1 (paper Eq. 6): m-1 monthly returns, skip r_t
                 mom = (1 + rets.iloc[t - m : t - 1]).prod() - 1
             mu    = mom.mean()
             sigma = mom.std()
             feats[f"zMOM{m}"] = (mom - mu) / (sigma + 1e-10)
             feats[f"MMOM{m}"] = mu
-            feats[f"sMOM{m}"] = sigma   # cross-sectional std dev — paper Eq. 8
 
-    # SIZE: single categorical 1-10 (paper Sec. 3.3.1), NOT one-hot
-    cap           = size.iloc[t - 1].rank(pct=True, na_option="keep").fillna(0.5)
-    feats["SIZE"] = ((cap * 9.999).astype(int) + 1).astype(float)
+    # SIZE: 10 binary dummies D_s, s=1..10 (paper Sec. 3.3.1)
+    cap         = size.iloc[t - 1].rank(pct=True, na_option="keep").fillna(0.5)
+    size_decile = ((cap * 9.999).astype(int) + 1)  # 1–10
+    for s in range(1, 11):
+        feats[f"SIZE_{s}"] = (size_decile == s).astype(float)
 
     return pd.DataFrame(feats, index=rets.columns)
 
@@ -343,7 +348,6 @@ def load_broad_universe_tiingo(
     min_coverage: float = 0.70,
     min_price: float = 1.0,
     api_key: str = "102cb09d2f83b832d38f00437fd18de26e025d95",
-    cache_path: str = "tiingo_universe_cache.parquet",
     checkpoint_path: str = "tiingo_download_checkpoint.parquet",
     max_workers: int = 20,
     skip_download: bool = False,
@@ -371,27 +375,7 @@ def load_broad_universe_tiingo(
     if end_date is None:
         end_date = pd.Timestamp.today().strftime("%Y-%m-%d")
 
-    # ── 1. Cache hit ──────────────────────────────────────────────────────────
-    if cache_path and os.path.exists(cache_path):
-        try:
-            cached = pd.read_parquet(cache_path)
-            if ("close" in cached.columns.get_level_values(0) and
-                    "volume" in cached.columns.get_level_values(0)):
-                close_wide  = cached["close"]
-                volume_wide = cached["volume"]
-                if (str(close_wide.index[0].date()) <= start_date and
-                        close_wide.index[-1].date() >= pd.Timestamp(end_date).date() - pd.Timedelta(days=10)):
-                    if verbose:
-                        print(f"[tiingo] cache hit: {cache_path}  "
-                              f"({close_wide.index[0].date()} – {close_wide.index[-1].date()})  "
-                              f"{close_wide.shape[1]:,} tickers")
-                    prices_monthly = close_wide
-                    volume_monthly = volume_wide
-                    rets_monthly   = prices_monthly.pct_change().clip(-0.5, 0.5)
-                    size_monthly   = (prices_monthly * volume_monthly).ffill()
-                    return prices_monthly, rets_monthly, size_monthly
-        except Exception:
-            pass
+    # ── 1. Checkpoint ─────────────────────────────────────────────────────────
 
     # ── 2. Load checkpoint ────────────────────────────────────────────────────
     done: dict[str, pd.DataFrame] = {}
@@ -528,12 +512,6 @@ def load_broad_universe_tiingo(
     if verbose:
         print(f"[tiingo] kept {good.sum():,}/{len(good):,} tickers "
               f"(≥12 months data, price≥${min_price} in ≥{min_coverage:.0%} of active months)")
-
-    # ── 6. Cache ──────────────────────────────────────────────────────────────
-    if cache_path:
-        pd.concat({"close": close_wide, "volume": volume_wide}, axis=1).to_parquet(cache_path)
-        if verbose:
-            print(f"[tiingo] saved → {cache_path}")
 
     prices_monthly = close_wide
     volume_monthly = volume_wide
@@ -692,18 +670,17 @@ def generate_dm_weights(
             mu_k     = np.array([grp.get_group(k).mean() if k in grp.groups else 0.0  for k in range(10)])
             sigma2_k = np.array([grp.get_group(k).var()  if k in grp.groups else 1e-4 for k in range(10)])
 
-            # Random 80:20 split per seed — paper Sec. 3.3.3
+            # Time-blocked split: last 20% of months as validation (paper Sec. 3.3.3)
+            n_tr    = len(all_ts) - n_val
+            tr_ts_s = all_ts[:n_tr]
+            va_ts_s = all_ts[n_tr:]
+            X_tr_s  = pd.concat([pool[t][0] for t in tr_ts_s if t in pool])
+            y_tr_s  = pd.concat([pool[t][1] for t in tr_ts_s if t in pool])
+            X_va_s  = pd.concat([pool[t][0] for t in va_ts_s if t in pool])
+            y_va_s  = pd.concat([pool[t][1] for t in va_ts_s if t in pool])
             print(f"  [{year}] pool={len(all_ts)}  n_val={n_val}  seeds={n_seeds}")
             models = []
             for seed in range(n_seeds):
-                rng_s   = np.random.default_rng(seed)
-                vi      = set(rng_s.choice(len(all_ts), size=n_val, replace=False).tolist())
-                tr_ts_s = [all_ts[i] for i in range(len(all_ts)) if i not in vi]
-                va_ts_s = [all_ts[i] for i in vi]
-                X_tr_s  = pd.concat([pool[t][0] for t in tr_ts_s if t in pool])
-                y_tr_s  = pd.concat([pool[t][1] for t in tr_ts_s if t in pool])
-                X_va_s  = pd.concat([pool[t][0] for t in va_ts_s if t in pool])
-                y_va_s  = pd.concat([pool[t][1] for t in va_ts_s if t in pool])
                 m = XGBClassifier(**XGB_PARAMS, random_state=seed).fit(
                     X_tr_s, y_tr_s, eval_set=[(X_va_s, y_va_s)], verbose=False
                 )
@@ -895,27 +872,24 @@ def _bench_weights(
     q: float = TOP_Q,
     min_train_months: int = MIN_TRAIN_YRS * 12,
     use_ffd: bool = True,
+    ffd_scores: dict | None = None,
 ) -> pd.DataFrame:
     """
-    Cross-sectional momentum long/short — no XGBoost.
-
-    With use_ffd=True: optimal d is found once on the initial training window
-    (prices_monthly.iloc[:first_pred]), then the causal FFD filter is applied
-    to the full series.  No look-ahead.
+    Cross-sectional momentum long(/short) — no XGBoost.
+    ffd_scores: pre-computed FFD scores (skips re-estimation if provided).
     """
     T          = len(rets)
     first_feat = max(MOM_WINDOWS) + 1
     first_pred = min_train_months + first_feat
     weight_rows = {}
 
-    ffd_scores = None
     signal_col = "zMOM12"
     if use_ffd:
-        print("  [bench FFD] computing optimal d on initial training window …")
-        ffd_scores = _ffd_from_training_window(prices_monthly, first_pred)
-        # Align index to rets (both month-end)
-        for m in MOM_WINDOWS:
-            ffd_scores[m] = ffd_scores[m].reindex(rets.index)
+        if ffd_scores is None:
+            print("  [bench FFD] computing optimal d on initial training window …")
+            ffd_scores = _ffd_from_training_window(prices_monthly, first_pred)
+            for m in MOM_WINDOWS:
+                ffd_scores[m] = ffd_scores[m].reindex(rets.index)
         signal_col = "zFFD12"
 
     for t in range(first_pred, T - 1):
@@ -945,15 +919,16 @@ def _generate_all_dm_weights(
     portfolio: str = "ls",
     q: float = TOP_Q,
     min_train_months: int = MIN_TRAIN_YRS * 12,
+    max_train_months: int = 60,
     n_seeds: int = N_SEEDS,
     use_ffd: bool = True,
+    ffd_scores: dict | None = None,
+    pool: dict | None = None,
 ) -> dict:
     """
-    Train XGBoost once (annual expanding window), then score DPR / RET / SRP.
-
-    With use_ffd=True: at each annual refit the optimal d is re-estimated using
-    only the current training window (no look-ahead).  The FFD filter is causal
-    so applying it to the full series after d is selected does not leak future data.
+    Train XGBoost (rolling window), then score DPR / RET / SRP.
+    max_train_months: cap on training window size (rolling, not expanding).
+    ffd_scores / pool: pass pre-computed values to skip recomputation.
     """
     T          = len(rets)
     first_feat = max(MOM_WINDOWS) + 1
@@ -962,25 +937,24 @@ def _generate_all_dm_weights(
     if first_pred >= T - 1:
         raise ValueError(f"Need ≥ {first_pred + 1} monthly obs; got {T}.")
 
-    # FFD: compute once on initial training window; updated annually below
-    ffd_scores = None
-    if use_ffd:
+    if use_ffd and ffd_scores is None:
         print("  [DM FFD] initial optimal-d search on first training window …")
         ffd_scores = _ffd_from_training_window(prices_monthly, first_pred)
         for m in MOM_WINDOWS:
             ffd_scores[m] = ffd_scores[m].reindex(rets.index)
 
-    pool = {}
-    for t in range(first_feat, T - 1):
-        F   = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
-        L   = make_labels(rets, t)
-        idx = (
-            F.index
-             .intersection(L.index)
-             .intersection(rets.iloc[t].dropna().index)
-        )
-        if len(idx) >= 20:
-            pool[t] = (F.loc[idx], L.loc[idx])
+    if pool is None:
+        pool = {}
+        for t in range(first_feat, T - 1):
+            F   = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
+            L   = make_labels(rets, t)
+            idx = (
+                F.index
+                 .intersection(L.index)
+                 .intersection(rets.iloc[t].dropna().index)
+            )
+            if len(idx) >= 20:
+                pool[t] = (F.loc[idx], L.loc[idx])
 
     rows        = {"dpr": {}, "ret": {}, "srp": {}}
     model_store = {}
@@ -992,28 +966,12 @@ def _generate_all_dm_weights(
             continue
         t_cut  = months[0]
         all_ts = sorted([t for t in pool if t < t_cut])
-        n_val  = max(6, int(len(all_ts) * 0.2))   # 20% validation — paper Sec. 3.3.3
+        # Rolling window: keep only the most recent max_train_months
+        if max_train_months and len(all_ts) > max_train_months:
+            all_ts = all_ts[-max_train_months:]
+        n_val  = max(6, int(len(all_ts) * 0.2))
 
         if len(all_ts) >= 18:
-            # ── Refresh FFD d on expanded training window (no leakage) ────────
-            if use_ffd:
-                ffd_scores = _ffd_from_training_window(prices_monthly, t_cut)
-                for m in MOM_WINDOWS:
-                    ffd_scores[m] = ffd_scores[m].reindex(rets.index)
-                # Rebuild pool features with updated FFD scores
-                pool = {}
-                for pt in range(first_feat, T - 1):
-                    F_   = make_features(rets, size, pt, ffd_scores=ffd_scores).dropna()
-                    L_   = make_labels(rets, pt)
-                    idx_ = (
-                        F_.index
-                         .intersection(L_.index)
-                         .intersection(rets.iloc[pt].dropna().index)
-                    )
-                    if len(idx_) >= 20:
-                        pool[pt] = (F_.loc[idx_], L_.loc[idx_])
-                all_ts = sorted([t for t in pool if t < t_cut])
-
             # mu_k / sigma2_k from the full training pool (not split-dependent)
             fwd_all  = pd.concat([rets.iloc[t].reindex(pool[t][0].index) for t in all_ts if t in pool])
             lab_all  = pd.concat([pool[t][1] for t in all_ts if t in pool])
@@ -1021,36 +979,34 @@ def _generate_all_dm_weights(
             mu_k     = np.array([grp.get_group(k).mean() if k in grp.groups else 0.0  for k in range(10)])
             sigma2_k = np.array([grp.get_group(k).var()  if k in grp.groups else 1e-4 for k in range(10)])
 
-            # Random 80:20 split per seed — paper Sec. 3.3.3
+            # Time-blocked split: last 20% of months as validation (paper Sec. 3.3.3)
+            n_tr    = len(all_ts) - n_val
+            tr_ts_s = all_ts[:n_tr]
+            va_ts_s = all_ts[n_tr:]
+            X_tr_s  = pd.concat([pool[t][0] for t in tr_ts_s if t in pool])
+            y_tr_s  = pd.concat([pool[t][1] for t in tr_ts_s if t in pool])
+            X_va_s  = pd.concat([pool[t][0] for t in va_ts_s if t in pool])
+            y_va_s  = pd.concat([pool[t][1] for t in va_ts_s if t in pool])
             print(f"  [{year}] pool={len(all_ts)}  n_val={n_val}  seeds={n_seeds}")
             models = []
             for seed in range(n_seeds):
-                rng_s   = np.random.default_rng(seed)
-                vi      = set(rng_s.choice(len(all_ts), size=n_val, replace=False).tolist())
-                tr_ts_s = [all_ts[i] for i in range(len(all_ts)) if i not in vi]
-                va_ts_s = [all_ts[i] for i in vi]
-                X_tr_s  = pd.concat([pool[t][0] for t in tr_ts_s if t in pool])
-                y_tr_s  = pd.concat([pool[t][1] for t in tr_ts_s if t in pool])
-                X_va_s  = pd.concat([pool[t][0] for t in va_ts_s if t in pool])
-                y_va_s  = pd.concat([pool[t][1] for t in va_ts_s if t in pool])
                 m = XGBClassifier(**XGB_PARAMS, random_state=seed).fit(
                     X_tr_s, y_tr_s, eval_set=[(X_va_s, y_va_s)], verbose=False
                 )
                 models.append(m)
-            model_store[year] = (models, mu_k, sigma2_k, ffd_scores)
+            model_store[year] = (models, mu_k, sigma2_k)
 
         elif model_store:
             model_store[year] = list(model_store.values())[-1]
         else:
             continue
 
-        mdls, mu_k, sigma2_k, ffd_scores_year = model_store[year]
+        mdls, mu_k, sigma2_k = model_store[year]
 
         for t in months:
             if t not in pool:
                 continue
-            # Use the ffd_scores that were current at retraining time
-            F = make_features(rets, size, t, ffd_scores=ffd_scores_year).dropna()
+            F = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
             if len(F) < 20:
                 continue
             signal_date = rets.index[t - 1]
@@ -1183,12 +1139,13 @@ def compare_strategies(
     *,
     n_seeds: int = N_SEEDS,
     min_train_months: int = MIN_TRAIN_YRS * 12,
+    max_train_months: int = 60,
     q: float = TOP_Q,
     transaction_cost: float = 0.001,
     save_fig: str = "dm_comparison_tiingo.png",
 ) -> dict:
     """
-    Run Bench (FFD-zMOM12), DM-DPR, DM-RET, DM-SRP L/S plus SPY B&H.
+    Run Bench (zMOM12 L/S), DM-DPR, DM-RET, DM-SRP L/S plus SPY B&H.
     preloaded : (prices_monthly, rets_monthly, size_monthly) from load_broad_universe_tiingo()
     Returns dict  label → backtest result dict.
     """
@@ -1206,19 +1163,21 @@ def compare_strategies(
     data_start = rets_monthly.index[0]
     data_end   = rets_monthly.index[-1]
 
-
-    # ── 2. Bench weights — FFD d found inside on training window (no leakage) ─
-    print("\n── Bench FFD (zFFD12 L/S) — optimal d on training window ───────────")
+    # ── 2. Bench weights (raw zMOM12 L/S) ────────────────────────────────────
+    print("\n── Bench zMOM12 L/S ─────────────────────────────────────────────────")
     bench_w = _bench_weights(
         rets_monthly, size_monthly, prices_monthly,
-        min_train_months=min_train_months, q=q, use_ffd=True,
+        min_train_months=min_train_months, q=q, use_ffd=False,
+        portfolio="ls",
     )
 
-    # ── 3. DM weights — FFD d refreshed annually on expanding window ─────────
-    print("\n── Deep Momentum FFD — annual d refresh, single XGBoost pass ───────")
+    # ── 3. DM weights (raw momentum features) ────────────────────────────────
+    print("\n── Deep Momentum L/S ────────────────────────────────────────────────")
     dm_w = _generate_all_dm_weights(
         rets_monthly, size_monthly, prices_monthly,
-        min_train_months=min_train_months, q=q, n_seeds=n_seeds, use_ffd=True,
+        min_train_months=min_train_months, max_train_months=max_train_months,
+        q=q, n_seeds=n_seeds, use_ffd=False,
+        portfolio="ls", pool=None,
     )
 
     # ── 4. SPY download ──────────────────────────────────────────────────────
@@ -1242,10 +1201,10 @@ def compare_strategies(
     oos_start_ref = None
 
     for label, raw_w in [
-        ("Bench FFD-zMOM12",  bench_w),
-        ("DM-FFD-DPR",        dm_w["dpr"]),
-        ("DM-FFD-RET",        dm_w["ret"]),
-        ("DM-FFD-SRP",        dm_w["srp"]),
+        ("Bench zMOM12 L/S",  bench_w),
+        ("DM-DPR L/S",        dm_w["dpr"]),
+        ("DM-RET L/S",        dm_w["ret"]),
+        ("DM-SRP L/S",        dm_w["srp"]),
     ]:
         oos_start = raw_w.index[0]
         if oos_start_ref is None:
@@ -1300,6 +1259,7 @@ def compare_strategies(
 
     # ── 6. Comparison table + equity chart ───────────────────────────────────
     print("\n" + "═" * 70)
+    years = round((data_end - oos_start_ref).days / 365.25, 1)
     analysis = BACKTEST.results_backtest(
         all_results,
         title=f"Deep Momentum vs Bench vs S&P 500 B&H  ({years}y, {oos_start_ref.year}–present)",
@@ -1327,15 +1287,12 @@ if __name__ == "__main__":
 
     if args and args[0] == "--compare-tiingo":
         # python deep_momentum_xgb.py --compare-tiingo [start_date] [n_seeds]
-        start_yr   = args[1] if len(args) > 1 else "2000-01-01"
-        seeds      = int(args[2]) if len(args) > 2 else N_SEEDS
+        start_yr    = args[1] if len(args) > 1 else "2000-01-01"
+        seeds       = int(args[2]) if len(args) > 2 else N_SEEDS
         ckpt_exists = os.path.exists("tiingo_download_checkpoint.parquet")
         print(f"\n[tiingo] Loading broad universe (start={start_yr}, seeds={seeds}) …")
-        data = load_broad_universe_tiingo(
-            start_date=start_yr,
-            skip_download=ckpt_exists,
-        )
-        compare_strategies(data, n_seeds=seeds)
+        data = load_broad_universe_tiingo(start_date=start_yr, skip_download=ckpt_exists)
+        compare_strategies(data, n_seeds=seeds, max_train_months=60)
 
     elif args and os.path.isfile(args[0]) and args[0].endswith(".csv"):
         # CSV archive pipeline: python deep_momentum_xgb.py all_stocks_5yr.csv srp ls
