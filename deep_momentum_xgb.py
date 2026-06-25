@@ -1011,7 +1011,6 @@ def run_with_backtest(
         lag=lag,
         transaction_cost=transaction_cost,
         signal_dates=signal_dates,
-        compute_risk_metrics=False,   # skip expensive MRC loop for PoC speed
     )
 
     # 6. Print summary
@@ -1314,6 +1313,11 @@ def compare_strategies(
     # so a single untradeable data-error move can't detonate the book.
     pnl_prices = _build_pnl_prices(prices_monthly)
 
+    # Size/liquidity-tiered ONE-WAY transaction costs: microcaps pay the wide-spread
+    # tiers, so the high-turnover raw-momentum bench is no longer assumed to trade
+    # near-free (size_monthly = price × volume = dollar volume).
+    tcost = BACKTEST.tiered_transaction_costs(size_monthly)
+
     # ── 2. Bench weights (raw zMOM12 L/S) ────────────────────────────────────
     print("\n── Bench zMOM12 L/S ─────────────────────────────────────────────────")
     bench_w = _bench_weights(
@@ -1349,7 +1353,7 @@ def compare_strategies(
     all_results = {}
     oos_start_ref = None
 
-    def _run_engine(weights: pd.DataFrame, prices_m: pd.DataFrame, tc: float) -> dict:
+    def _run_engine(weights: pd.DataFrame, prices_m: pd.DataFrame, tc) -> dict:
         first = weights.index[0]
         px_bt = prices_m.loc[first:]                     # trim → correct annualisation
         sigs  = [d for d in weights.index if d in px_bt.index]
@@ -1359,7 +1363,6 @@ def compare_strategies(
             freq=12, lag=0,
             transaction_cost=tc,
             signal_dates=sigs,
-            compute_risk_metrics=False,
         )
 
     #   DM       DM-RET reclassification (Σ pₖμₖ), equal-weight decile L/S
@@ -1381,7 +1384,7 @@ def compare_strategies(
             f"\n  [{label}]  {oos_start.date()} – {raw_w.index[-1].date()}"
             f"  |  {n_months} signal months  |  {n_tickers} active tickers"
         )
-        res = _run_engine(raw_w, pnl_prices, transaction_cost)
+        res = _run_engine(raw_w, pnl_prices, tcost)
         res["name"] = label
         all_results[label] = res
 
@@ -1394,7 +1397,6 @@ def compare_strategies(
         freq=12, lag=0,
         transaction_cost=0.0,
         signal_dates=[spy_bt.index[0]],
-        compute_risk_metrics=False,
     )
     spy_res["name"] = "S&P 500 B&H"
     all_results["S&P 500 B&H"] = spy_res
@@ -1405,7 +1407,6 @@ def compare_strategies(
     analysis = BACKTEST.results_backtest(
         all_results,
         title=f"Deep Momentum vs Bench vs S&P 500 B&H  ({years}y, {oos_start_ref.year}–present)",
-        fama_french=False,
     )
 
     fig = analysis["fig"]
