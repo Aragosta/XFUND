@@ -98,29 +98,58 @@ def tiered_transaction_costs(
     it clears; illiquid names pay the wide-spread tiers.  Never NaN (NaN volume →
     worst tier), so it is safe to feed straight into `backtest(transaction_cost=...)`.
     """
-    dv   = dollar_volume.rolling(lookback, min_periods=1).mean()
-    cost = pd.DataFrame(max(c for _, c in tiers), index=dv.index, columns=dv.columns)
+    return _tiered(dollar_volume, tiers, lookback)
+
+
+# Annual short-BORROW fee by liquidity (general collateral → hard-to-borrow).
+# IBKR: GC ~0.25-0.5%/yr; HTB 5-50%+/yr, microcaps 100%+ (often unborrowable — see
+# the SSR locate filter in compute_eligibility, which removes those entirely).
+DEFAULT_BORROW_TIERS = (
+    (1e9, 0.0025),   # ≥ $1B/mo  →  0.25%/yr  (general collateral)
+    (1e8, 0.0100),   # ≥ $100M   →  1%/yr
+    (1e7, 0.0500),   # ≥ $10M    →  5%/yr
+    (1e6, 0.2500),   # ≥ $1M     → 25%/yr     (hard to borrow)
+    (0.0, 0.5000),   # < $1M     → 50%/yr
+)
+
+
+def tiered_borrow_fees(
+    dollar_volume: pd.DataFrame,
+    *,
+    tiers: tuple = DEFAULT_BORROW_TIERS,
+    lookback: int = 3,
+) -> pd.DataFrame:
+    """Per-name ANNUAL short-borrow fee from trailing dollar volume (see tiers)."""
+    return _tiered(dollar_volume, tiers, lookback)
+
+
+def _tiered(dollar_volume: pd.DataFrame, tiers: tuple, lookback: int) -> pd.DataFrame:
+    dv  = dollar_volume.rolling(lookback, min_periods=1).mean()
+    out = pd.DataFrame(max(c for _, c in tiers), index=dv.index, columns=dv.columns)
     for thresh, c in sorted(tiers, key=lambda x: x[0]):       # ascending → highest wins
-        cost = cost.mask(dv >= thresh, c)
-    return cost
+        out = out.mask(dv >= thresh, c)
+    return out
 
 
 # ── core engine (JIT) ───────────────────────────────────────────────────────
 @jit(nopython=True, cache=True)
-def _drift_core(rets, w_target, tc, short_mult, exec_idx, n_dates, n_assets):
+def _drift_core(rets, w_target, tc, short_mult, bf, ppy, exec_idx, n_dates, n_assets):
     """
-    Drift backtest with per-name one-way costs.
+    Drift backtest with per-name one-way trading costs + short-borrow holding fees.
 
     rets      : (T, N) period returns (NaN treated as 0).
     w_target  : (T, N) target weights, populated at execution rows.
-    tc        : (T, N) one-way cost fractions.
-    short_mult: cost multiplier applied to short positions (rough borrow proxy).
+    tc        : (T, N) one-way trading-cost fractions.
+    short_mult: trading-cost multiplier for short trades (execution penalty).
+    bf        : (T, N) ANNUAL borrow-fee rates; charged each period on short notional.
+    ppy       : periods per year (annual borrow fee → per-period = bf / ppy).
     exec_idx  : (T,) 1 where a rebalance executes.
-    Returns   : equity (T,), turnover_gross (T,), cost_frac (T,).
+    Returns   : equity, turnover_gross, cost_frac (trading), borrow_frac (holding).
     """
     equity = np.ones(n_dates)
     turnover_gross = np.zeros(n_dates)
     cost_frac = np.zeros(n_dates)
+    borrow_frac = np.zeros(n_dates)
     w = np.zeros(n_assets)
 
     for i in range(n_dates):
@@ -131,8 +160,8 @@ def _drift_core(rets, w_target, tc, short_mult, exec_idx, n_dates, n_assets):
                 dwj = w_target[i, j] - w[j]
                 adw = dwj if dwj >= 0.0 else -dwj
                 t_over += adw
-                ## rough short-borrow proxy: a resulting short position pays short_mult×
-                ## the transaction cost (stand-in for borrow fee + harder execution).
+                ## short trades pay short_mult× the transaction cost (harder execution);
+                ## the ongoing borrow fee is charged separately below.
                 cj = tc[i, j] * short_mult if w_target[i, j] < 0.0 else tc[i, j]
                 cost += cj * adw                   # one-way cost on full traded notional
                 w[j] = w_target[i, j]
@@ -143,13 +172,21 @@ def _drift_core(rets, w_target, tc, short_mult, exec_idx, n_dates, n_assets):
 
         if i > 0:
             rp = 0.0
+            borrow = 0.0
             for j in range(n_assets):
                 r = rets[i, j]
                 if r == r:                          # not NaN
                     rp += w[j] * r
+                if w[j] < 0.0:                      # borrow fee on short notional held this period
+                    borrow += (-w[j]) * bf[i, j]
+            borrow /= ppy
+            if borrow > 0.999:
+                borrow = 0.999
+            borrow_frac[i] = borrow
             equity[i] = equity[i - 1] * (1.0 + rp)
             if exec_idx[i] == 1:
                 equity[i] *= (1.0 - cost_frac[i])
+            equity[i] *= (1.0 - borrow)             # short-borrow holding fee
             denom = 1.0 + rp
             if denom > 0.0 and np.isfinite(denom):  # drift weights to next period
                 for j in range(n_assets):
@@ -158,7 +195,7 @@ def _drift_core(rets, w_target, tc, short_mult, exec_idx, n_dates, n_assets):
                         r = 0.0
                     w[j] = w[j] * (1.0 + r) / denom
 
-    return equity, turnover_gross, cost_frac
+    return equity, turnover_gross, cost_frac, borrow_frac
 
 
 # ── metrics ─────────────────────────────────────────────────────────────────
@@ -171,7 +208,7 @@ def _tail_mean(sorted_vals: np.ndarray, pct: float) -> float:
     return float(np.mean(tail))
 
 
-def _metrics(equity, turnover, cost_frac, freq, rf) -> dict:
+def _metrics(equity, turnover, cost_frac, borrow_frac, freq, rf) -> dict:
     """Performance/risk metrics from an equity curve (and turnover/cost series)."""
     net_ret = equity.pct_change(fill_method=None).fillna(0.0).rename("returns")
     net_ret.iloc[0] = 0.0
@@ -199,6 +236,7 @@ def _metrics(equity, turnover, cost_frac, freq, rf) -> dict:
     expectancy = win_rate * (pos.mean() if len(pos) else 0.0) + (len(negr) / n if n else 0.0) * (negr.mean() if len(negr) else 0.0)
 
     cost_amount = (equity * cost_frac / (1.0 - cost_frac).clip(lower=1e-12)).where(cost_frac > 0, 0.0)
+    borrow_amount = (equity * borrow_frac / (1.0 - borrow_frac).clip(lower=1e-12)).where(borrow_frac > 0, 0.0)
     avg_turnover = float(turnover.mean())
 
     return {
@@ -224,6 +262,8 @@ def _metrics(equity, turnover, cost_frac, freq, rf) -> dict:
         "ann_turnover": avg_turnover * freq,
         "total_turnover": float(turnover.sum()),
         "total_cost": float(cost_amount.sum()),
+        "ann_borrow": float(borrow_frac.to_numpy()[1:].mean() * freq) if n else np.nan,
+        "total_borrow": float(borrow_amount.sum()),
     }
 
 
@@ -237,6 +277,7 @@ def backtest(
     signal_dates: list | None = None,
     transaction_cost=0.0,
     short_cost_mult: float = 1.5,
+    borrow_fee=0.0,
     risk_free_rate: float = 0.0,
 ) -> dict:
     """
@@ -248,9 +289,11 @@ def backtest(
     freq             : annualization factor (252 daily, 12 monthly).
     lag              : signal→execution lag; weights at t earn the t+lag → t+lag+1 return.
     signal_dates     : rebalance dates (default: every date).
-    transaction_cost : one-way cost — scalar, or (dates×tickers) DataFrame (see
-                       `tiered_transaction_costs`).
-    short_cost_mult  : ## rough short-borrow proxy — shorts pay this × the cost (default 1.5).
+    transaction_cost : one-way trade cost — scalar or (dates×tickers) DataFrame
+                       (`tiered_transaction_costs`).
+    short_cost_mult  : extra execution penalty on short *trades* (default 1.5×).
+    borrow_fee       : ANNUAL short-borrow holding fee charged each period on short
+                       notional — scalar or (dates×tickers) DataFrame (`tiered_borrow_fees`).
     Returns a metrics dict (see `_metrics`).
     """
     if lag < 0:
@@ -265,16 +308,9 @@ def backtest(
     w_target = _as_weights_df(weights, index=idx, columns=cols)
     rets = px.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
 
-    # one-way cost matrix (scalar → broadcast; DataFrame → align, worst-tier fallback)
-    if isinstance(transaction_cost, (pd.DataFrame, pd.Series)):
-        tc_df = (transaction_cost if isinstance(transaction_cost, pd.DataFrame)
-                 else transaction_cost.to_frame().T)
-        fallback = float(np.nanmax(tc_df.to_numpy())) if tc_df.size else 0.0
-        tc_np = tc_df.reindex(index=idx, columns=cols).ffill().fillna(fallback).to_numpy(float)
-    else:
-        if transaction_cost < 0:
-            raise ValueError("`transaction_cost` must be >= 0.")
-        tc_np = np.full((n_dates, n_assets), float(transaction_cost))
+    # rate matrices (scalar → broadcast; DataFrame → align, worst-tier fallback)
+    tc_np = _rate_matrix(transaction_cost, idx, cols, n_dates, n_assets)
+    bf_np = _rate_matrix(borrow_fee, idx, cols, n_dates, n_assets)
 
     # execution timing: signal at t → execute at t+lag+1
     if signal_dates is None:
@@ -294,17 +330,29 @@ def backtest(
         row[px.iloc[ep].isna().to_numpy()] = 0.0     # can't trade a name with no execution price
         w_target_np[ep] = row
 
-    equity_np, turn_np, cost_np = _drift_core(
+    equity_np, turn_np, cost_np, borrow_np = _drift_core(
         rets.to_numpy(float), w_target_np, tc_np, float(short_cost_mult),
-        exec_idx, n_dates, n_assets
+        bf_np, float(freq), exec_idx, n_dates, n_assets
     )
 
     equity = pd.Series(equity_np, index=idx)
     turnover = pd.Series(0.5 * turn_np, index=idx, name="turnover")    # one-way turnover (reporting)
     cost_frac = pd.Series(cost_np, index=idx, name="cost_frac")
-    out = _metrics(equity, turnover, cost_frac, float(freq), float(risk_free_rate))
+    borrow_frac = pd.Series(borrow_np, index=idx, name="borrow_frac")
+    out = _metrics(equity, turnover, cost_frac, borrow_frac, float(freq), float(risk_free_rate))
     out["transaction_cost"] = transaction_cost if np.isscalar(transaction_cost) else "tiered"
     return out
+
+
+def _rate_matrix(val, idx, cols, n_dates, n_assets) -> np.ndarray:
+    """Coerce a scalar or (dates×tickers) DataFrame rate into a dense (T, N) array."""
+    if isinstance(val, (pd.DataFrame, pd.Series)):
+        df = val if isinstance(val, pd.DataFrame) else val.to_frame().T
+        fallback = float(np.nanmax(df.to_numpy())) if df.size else 0.0
+        return df.reindex(index=idx, columns=cols).ffill().fillna(fallback).to_numpy(float)
+    if val < 0:
+        raise ValueError("rate must be >= 0.")
+    return np.full((n_dates, n_assets), float(val))
 
 
 # ── generic out-of-sample walk-forward ──────────────────────────────────────
@@ -386,6 +434,7 @@ _SUMMARY_METRICS = [
     ("CVaR (95%)", "cvar_ann", ".2%"),
     ("Downside Deviation", "downside_deviation", ".2%"),
     ("Ann. Turnover", "ann_turnover", ".2%"),
+    ("Ann. Borrow", "ann_borrow", ".2%"),
     ("Total Cost", "total_cost", ".2%"),
 ]
 

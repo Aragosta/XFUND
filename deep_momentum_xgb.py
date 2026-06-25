@@ -379,24 +379,27 @@ def compute_eligibility(
     min_history: int = 12,
     min_dollar_vol_pct: float = 0.0,
     min_dollar_vol_abs: float = 5e6,
-) -> pd.DataFrame:
+    short_min_dollar_vol_abs: float = 25e6,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Point-in-time (causal) tradeability / liquidity mask — NO look-ahead.
+    Point-in-time (causal) tradeability masks — NO look-ahead.  Returns
+    (eligible, shortable), both T×N booleans aligned to prices_monthly.
 
-    A stock is eligible at month t iff, using ONLY data up to and including t:
+    A stock is ELIGIBLE (long-tradeable) at month t iff, using ONLY data ≤ t:
       1. current price > min_price (penny-stock floor), AND
       2. price > min_price in ≥ min_coverage of the trailing window months
          (requires ≥ min_history valid months), AND
-      3. (if size_monthly given) trailing 3-month average dollar volume is BOTH:
-           a. in the top (1 − min_dollar_vol_pct) percentile cross-sectionally, AND
-           b. above min_dollar_vol_abs in absolute terms.
-         The absolute floor prevents the relative filter from admitting illiquid
-         micro-caps when the whole cross-section has low liquidity (e.g. 2001–2003).
+      3. (if size_monthly given) trailing 3-month avg dollar volume is in the top
+         (1 − min_dollar_vol_pct) percentile AND above min_dollar_vol_abs.
 
-    All rules use strictly backward rolling windows → no look-ahead.
-    Evaluate at signal date (t−1) to get the point-in-time eligible universe.
+    A stock is SHORTABLE iff it is eligible AND its trailing dollar volume clears
+    a higher floor (short_min_dollar_vol_abs).  This is the borrowability / EU-SSR
+    "locate" proxy: hard-to-borrow micro-caps cannot be legally / practically shorted,
+    so they are removed from the short book entirely (borrow cost is applied to the
+    rest via BACKTEST.tiered_borrow_fees).
 
-    Returns T×N boolean DataFrame aligned to prices_monthly.
+    All rules use strictly backward rolling windows → no look-ahead.  Evaluate at the
+    signal date (t−1) to get the point-in-time universe.
     """
     valid   = prices_monthly.notna()
     good_px = (prices_monthly > min_price) & valid
@@ -404,17 +407,19 @@ def compute_eligibility(
     n_good  = good_px.rolling(window, min_periods=min_history).sum()
     cov     = n_good / n_valid.clip(lower=1)
     elig    = (cov >= min_coverage) & (prices_monthly > min_price) & (n_valid >= min_history)
+    shortable = elig.copy()
 
     if size_monthly is not None:
         # 3-month trailing average dollar volume (point-in-time, causal)
         dv = size_monthly.reindex_like(prices_monthly).rolling(3, min_periods=1).mean()
         if min_dollar_vol_pct > 0:
-            rank = dv.rank(axis=1, pct=True)
-            elig = elig & (rank >= min_dollar_vol_pct)
+            elig = elig & (dv.rank(axis=1, pct=True) >= min_dollar_vol_pct)
         if min_dollar_vol_abs > 0:
             elig = elig & (dv >= min_dollar_vol_abs)
+        # borrowability: stricter liquidity floor for the short side
+        shortable = elig & (dv >= short_min_dollar_vol_abs)
 
-    return elig.fillna(False)
+    return elig.fillna(False), shortable.fillna(False)
 
 
 def _build_pnl_prices(
@@ -1055,12 +1060,14 @@ def _bench_weights(
     use_ffd: bool = True,
     ffd_scores: dict | None = None,
     eligible: pd.DataFrame | None = None,
+    shortable: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Cross-sectional momentum long(/short) — no XGBoost.
     ffd_scores: pre-computed FFD scores (skips re-estimation if provided).
     eligible  : point-in-time tradeability mask (compute_eligibility); applied at
                 the signal date t-1 so the traded universe has no look-ahead.
+    shortable : borrowability mask; the short leg is restricted to these names.
     """
     T          = len(rets)
     first_feat = max(MOM_WINDOWS) + 1
@@ -1089,7 +1096,11 @@ def _bench_weights(
         w     = pd.Series(0.0, index=F.index)
         w[s_ser.nlargest(n).index]  = +1.0 / n
         if portfolio == "ls":
-            w[s_ser.nsmallest(n).index] = -1.0 / n
+            s_short = s_ser
+            if shortable is not None:                       # borrowability: short only HTB-eligible
+                sh = shortable.iloc[t - 1]
+                s_short = s_ser.loc[s_ser.index.intersection(sh.index[sh.values])]
+            w[s_short.nsmallest(n).index] = -1.0 / n
         weight_rows[signal_date] = w
 
     df = pd.DataFrame(weight_rows).T.fillna(0.0).sort_index()
@@ -1112,6 +1123,7 @@ def _generate_all_dm_weights(
     ffd_scores: dict | None = None,
     pool: dict | None = None,
     eligible: pd.DataFrame | None = None,
+    shortable: pd.DataFrame | None = None,
 ) -> dict:
     """
     Train XGBoost (rolling window), then score DPR / RET / SRP.
@@ -1119,6 +1131,7 @@ def _generate_all_dm_weights(
     ffd_scores / pool: pass pre-computed values to skip recomputation.
     eligible: point-in-time tradeability mask (compute_eligibility), applied at the
               signal date t-1 to both the training pool and the traded universe.
+    shortable: borrowability mask; the short leg is restricted to these names.
     """
     T          = len(rets)
     first_feat = max(MOM_WINDOWS) + 1
@@ -1209,7 +1222,11 @@ def _generate_all_dm_weights(
             w     = pd.Series(0.0, index=F.index)
             w[s_ser.nlargest(n).index]  = +1.0 / n
             if portfolio == "ls":
-                w[s_ser.nsmallest(n).index] = -1.0 / n
+                s_short = s_ser
+                if shortable is not None:               # borrowability: short only HTB-eligible
+                    sh = shortable.iloc[t - 1]
+                    s_short = s_ser.loc[s_ser.index.intersection(sh.index[sh.values])]
+                w[s_short.nsmallest(n).index] = -1.0 / n
             rows["ret"][signal_date] = w
 
     out = {}
@@ -1300,30 +1317,33 @@ def compare_strategies(
     data_start = rets_monthly.index[0]
     data_end   = rets_monthly.index[-1]
 
-    # Point-in-time tradeability + liquidity mask (causal).
-    eligible = compute_eligibility(
+    # Point-in-time tradeability + borrowability masks (causal).  `shortable` is the
+    # stricter (EU-SSR locate / hard-to-borrow) filter applied to the short book only.
+    eligible, shortable = compute_eligibility(
         prices_monthly, size_monthly,
         min_dollar_vol_pct=min_dollar_vol_pct,
         min_dollar_vol_abs=min_dollar_vol_abs,
     )
+    sel = rets_monthly.index
     print(f"[eligibility] avg tradeable names/month: "
-          f"{eligible.loc[rets_monthly.index].sum(axis=1).iloc[min_train_months:].mean():.0f}")
+          f"{eligible.loc[sel].sum(axis=1).iloc[min_train_months:].mean():.0f}  "
+          f"| shortable: {shortable.loc[sel].sum(axis=1).iloc[min_train_months:].mean():.0f}")
 
     # Cleaned price series for PnL (winsorised realised returns + delisting),
     # so a single untradeable data-error move can't detonate the book.
     pnl_prices = _build_pnl_prices(prices_monthly)
 
-    # Size/liquidity-tiered ONE-WAY transaction costs: microcaps pay the wide-spread
-    # tiers, so the high-turnover raw-momentum bench is no longer assumed to trade
-    # near-free (size_monthly = price × volume = dollar volume).
+    # Size/liquidity-tiered ONE-WAY transaction costs + ANNUAL short-borrow fees:
+    # microcaps pay wide spreads and high borrow rates (size_monthly = dollar volume).
     tcost = BACKTEST.tiered_transaction_costs(size_monthly)
+    bfee  = BACKTEST.tiered_borrow_fees(size_monthly)
 
     # ── 2. Bench weights (raw zMOM12 L/S) ────────────────────────────────────
     print("\n── Bench zMOM12 L/S ─────────────────────────────────────────────────")
     bench_w = _bench_weights(
         rets_monthly, size_monthly, prices_monthly,
         min_train_months=min_train_months, q=q, use_ffd=False,
-        portfolio="ls", eligible=eligible,
+        portfolio="ls", eligible=eligible, shortable=shortable,
     )
 
     # ── 3. DM weights (momentum + dynamics + FFD features) ───────────────────
@@ -1334,7 +1354,7 @@ def compare_strategies(
         rets_monthly, size_monthly, prices_monthly,
         min_train_months=min_train_months, max_train_months=max_train_months,
         q=q, n_seeds=n_seeds, use_ffd=True,
-        portfolio="ls", pool=None, eligible=eligible,
+        portfolio="ls", pool=None, eligible=eligible, shortable=shortable,
     )
 
     # ── 4. SPY benchmark (Tiingo — same source as the universe) ──────────────
@@ -1362,6 +1382,7 @@ def compare_strategies(
             w_bt, px_bt,
             freq=12, lag=0,
             transaction_cost=tc,
+            borrow_fee=bfee,
             signal_dates=sigs,
         )
 

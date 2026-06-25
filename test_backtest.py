@@ -78,6 +78,22 @@ def test_short_costs_1p5x():
     print(f"✓ short borrow proxy: short cost / long cost = {cost_short/cost_long:.2f}×")
 
 
+def test_short_borrow_fee():
+    """A held short pays borrow = annual_rate/freq each period; a long pays none."""
+    px = pd.DataFrame({"A": [1.0] * 13}, index=dates(13))     # flat prices → isolate borrow
+    short = backtest(pd.DataFrame({"A": [-1.0]}, index=[px.index[0]]), px,
+                     freq=12, lag=0, transaction_cost=0.0, borrow_fee=0.12,
+                     signal_dates=[px.index[0]])
+    _close(short["ann_borrow"], 0.12)                         # 1%/mo × 12
+    _close(short["total_return"], 0.99 ** 12 - 1)             # -1%/mo compounded, 12 periods
+    long_ = backtest(pd.DataFrame({"A": [1.0]}, index=[px.index[0]]), px,
+                     freq=12, lag=0, transaction_cost=0.0, borrow_fee=0.12,
+                     signal_dates=[px.index[0]])
+    _close(long_["ann_borrow"], 0.0)                          # long pays no borrow
+    _close(long_["total_return"], 0.0)
+    print("✓ short borrow fee: 12%/yr ⇒ -1%/mo on the short; long pays nothing")
+
+
 def test_no_lookahead_timing():
     """A signal on the jump date must NOT capture that period's jump (executes next period)."""
     px = pd.DataFrame({"A": [1.0, 1.0, 1.0, 2.0, 2.0]}, index=dates(5))   # +100% return at index 3
@@ -123,6 +139,7 @@ if __name__ == "__main__":
     test_known_volatility()
     test_transaction_cost_exact()
     test_short_costs_1p5x()
+    test_short_borrow_fee()
     test_no_lookahead_timing()
     test_tiered_cost_tiers()
     test_walk_forward_is_oos()
