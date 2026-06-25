@@ -978,18 +978,16 @@ def _generate_all_dm_weights(
         pool = {}
         for t in range(first_feat, T - 1):
             F   = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
-            L   = make_labels(rets, t)                                   # t+1 horizon (month t)
-            L2  = make_labels(rets, t + 1) if (t + 1) < T else pd.Series(dtype=int)  # t+2 horizon
+            L   = make_labels(rets, t)
             idx = (
                 F.index
                  .intersection(L.index)
                  .intersection(rets.iloc[t].dropna().index)
             )
             if len(idx) >= 20:
-                pool[t] = (F.loc[idx], L.loc[idx], L2.reindex(idx))
+                pool[t] = (F.loc[idx], L.loc[idx])
 
-    rows        = {"dpr": {}, "ret": {}, "srp": {}, "ret2": {}}
-    phi_list    = []          # cross-sectional corr(μ¹, μ²): alpha-persistence diagnostic
+    rows        = {"ret": {}}
     model_store = {}
     pred_years  = sorted({rets.index[t].year for t in range(first_pred, T - 1)})
 
@@ -1005,12 +1003,11 @@ def _generate_all_dm_weights(
         n_val  = max(6, int(len(all_ts) * 0.2))
 
         if len(all_ts) >= 18:
-            # mu_k / sigma2_k from the full training pool (not split-dependent)
+            # Decile mean returns μ_k for the RET reclassification (law of total expectation)
             fwd_all  = pd.concat([rets.iloc[t].reindex(pool[t][0].index) for t in all_ts if t in pool])
             lab_all  = pd.concat([pool[t][1] for t in all_ts if t in pool])
             grp      = pd.DataFrame({"l": lab_all.values, "r": fwd_all.values}).groupby("l")["r"]
-            mu_k     = np.array([grp.get_group(k).mean() if k in grp.groups else 0.0  for k in range(10)])
-            sigma2_k = np.array([grp.get_group(k).var()  if k in grp.groups else 1e-4 for k in range(10)])
+            mu_k     = np.array([grp.get_group(k).mean() if k in grp.groups else 0.0 for k in range(10)])
 
             # Time-blocked split: last 20% of months as validation (paper Sec. 3.3.3)
             n_tr    = len(all_ts) - n_val
@@ -1027,26 +1024,14 @@ def _generate_all_dm_weights(
                     X_tr_s, y_tr_s, eval_set=[(X_va_s, y_va_s)], verbose=False
                 )
                 models.append(m)
-
-            # t+2 horizon ensemble: SAME features, label = decile of r_{t+1} (multi-horizon).
-            y2_tr = pd.concat([pool[t][2] for t in tr_ts_s if t in pool])
-            y2_va = pd.concat([pool[t][2] for t in va_ts_s if t in pool])
-            m2tr, m2va = y2_tr.notna().values, y2_va.notna().values
-            models2 = []
-            for seed in range(n_seeds):
-                m = XGBClassifier(**XGB_PARAMS, random_state=seed).fit(
-                    X_tr_s[m2tr], y2_tr[m2tr].astype(int),
-                    eval_set=[(X_va_s[m2va], y2_va[m2va].astype(int))], verbose=False
-                )
-                models2.append(m)
-            model_store[year] = (models, models2, mu_k, sigma2_k)
+            model_store[year] = (models, mu_k)
 
         elif model_store:
             model_store[year] = list(model_store.values())[-1]
         else:
             continue
 
-        mdls, mdls2, mu_k, sigma2_k = model_store[year]
+        mdls, mu_k = model_store[year]
 
         for t in months:
             if t not in pool:
@@ -1055,42 +1040,16 @@ def _generate_all_dm_weights(
             if len(F) < 20:
                 continue
             signal_date = rets.index[t - 1]
-            probs       = np.mean([m.predict_proba(F) for m in mdls],  axis=0)
-            probs2      = np.mean([m.predict_proba(F) for m in mdls2], axis=0)
+            probs       = np.mean([m.predict_proba(F) for m in mdls], axis=0)
 
-            mu_i  = probs  @ mu_k     # E[r_{t}]   (t+1-horizon expected return)
-            mu_i2 = probs2 @ mu_k     # E[r_{t+1}] (t+2-horizon expected return)
-            # term-structure correlation = alpha persistence (sets optimal trade rate)
-            if np.std(mu_i) > 0 and np.std(mu_i2) > 0:
-                phi_list.append(float(np.corrcoef(mu_i, mu_i2)[0, 1]))
-
-            # Standard single-horizon DM scores
-            for name, sc in [
-                ("dpr", score_dpr(probs)),
-                ("ret", score_ret(probs, mu_k)),
-                ("srp", score_srp(probs, mu_k, sigma2_k)),
-            ]:
-                s_ser = pd.Series(sc, index=F.index)
-                n     = max(1, int(len(s_ser) * q))
-                w     = pd.Series(0.0, index=F.index)
-                w[s_ser.nlargest(n).index]  = +1.0 / n
-                if portfolio == "ls":
-                    w[s_ser.nsmallest(n).index] = -1.0 / n
-                rows[name][signal_date] = w
-
-            # ret2: multi-horizon expected-return score μ¹+μ² — holds names whose
-            # edge PERSISTS across both horizons → fewer boundary crossings → lower turnover.
-            s2 = pd.Series(mu_i + mu_i2, index=F.index)
-            n2 = max(1, int(len(s2) * q))
-            w2 = pd.Series(0.0, index=F.index)
-            w2[s2.nlargest(n2).index] = +1.0 / n2
+            sc    = score_ret(probs, mu_k)          # DM-RET reclassification (Σ pₖμₖ)
+            s_ser = pd.Series(sc, index=F.index)
+            n     = max(1, int(len(s_ser) * q))
+            w     = pd.Series(0.0, index=F.index)
+            w[s_ser.nlargest(n).index]  = +1.0 / n
             if portfolio == "ls":
-                w2[s2.nsmallest(n2).index] = -1.0 / n2
-            rows["ret2"][signal_date] = w2
-
-    if phi_list:
-        print(f"\n  [multi-horizon] mean corr(μ¹, μ²) φ = {np.mean(phi_list):+.3f}  "
-              f"(alpha persistence; high → t+1 signal survives to t+2)")
+                w[s_ser.nsmallest(n).index] = -1.0 / n
+            rows["ret"][signal_date] = w
 
     out = {}
     for name, weight_rows in rows.items():
@@ -1300,18 +1259,14 @@ def compare_strategies(
     all_results = {}
     oos_start_ref = None
 
-    # Champion (RET+GP) vs the multi-horizon t+2 variant:
-    #   DM-RET         equal-weight decile L/S (best single-horizon criterion)
-    #   DM-RET+GP      champion: GP partial adjustment (delta=0.5)
-    #   DM-RET2+GP     multi-horizon score μ¹+μ² + GP partial adjustment
-    dm_ret      = dm_w["ret"]
-    dm_ret_gp   = apply_partial_adjustment(dm_ret,        delta=0.5)
-    dm_ret2_gp  = apply_partial_adjustment(dm_w["ret2"],  delta=0.5)
+    #   DM       DM-RET reclassification (Σ pₖμₖ), equal-weight decile L/S
+    #   DM-GP    DM + Gârleanu–Pedersen partial adjustment (delta=0.5)
+    dm     = dm_w["ret"]
+    dm_gp  = apply_partial_adjustment(dm, delta=0.5)
     for label, raw_w in [
-        ("Bench zMOM12 L/S",  bench_w),       # raw momentum benchmark
-        ("DM-RET L/S",        dm_ret),        # best single-horizon DM criterion
-        ("DM-RET+GP L/S",     dm_ret_gp),     # champion: + GP turnover control
-        ("DM-RET2+GP L/S",    dm_ret2_gp),    # multi-horizon (t+1 & t+2) + GP
+        ("Bench zMOM12 L/S",  bench_w),   # raw momentum benchmark
+        ("DM L/S",            dm),        # DM-RET reclassification
+        ("DM-GP L/S",         dm_gp),     # DM + GP turnover control
     ]:
         oos_start = raw_w.index[0]
         if oos_start_ref is None:
