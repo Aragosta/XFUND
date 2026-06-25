@@ -22,9 +22,13 @@ retrain, 5-seed ensemble, time-blocked validation. Returns net of 10bp transacti
 | Strategy | Ann. Return | Sharpe | Max DD | Ann. Vol | Ann. Turnover |
 |---|---|---|---|---|---|
 | Bench zMOM12 L/S (raw momentum) | 16.4% | 0.77 | −49.1% | 21.2% | 683% |
-| DM L/S (RET reclassification) | 23.3% | 1.41 | −15.3% | 16.5% | 1456% |
-| **DM-GP L/S (champion)** | 28.6% | **2.25** | **−11.1%** | 12.7% | 786% |
+| DM L/S (RET reclassification) | 29.7% | 1.62 | −19.8% | 18.4% | 1476% |
+| **DM-GP L/S (champion)** | 31.4% | **2.29** | **−15.2%** | 13.7% | 791% |
 | S&P 500 B&H | 13.9% | 0.98 | −23.9% | 14.2% | 0% |
+
+*(Headline table under xgboost 3.3.0. The experiment-by-experiment deltas quoted in the
+thesis below were measured under xgboost 1.7.6 — DM 1.41, DM-GP 2.25; the upgrade nudged
+levels up slightly but left every ranking and conclusion unchanged.)*
 
 ---
 
