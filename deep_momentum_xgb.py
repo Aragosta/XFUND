@@ -146,16 +146,26 @@ def make_features(
 
 
 # ── 3. Label construction ─────────────────────────────────────────────────────
-def make_labels(rets: pd.DataFrame, t: int) -> pd.Series:
+def _decile_labels(fwd: pd.Series) -> pd.Series:
     """
-    Next-month cross-sectional return decile, 0-indexed.
+    Rank-based cross-sectional return deciles, 0-indexed, descending.
     Label 0 = highest return decile, label 9 = lowest.
 
-    Paper formula: label = 10 - qcut(..., labels=False)  → 0-indexed via -1.
-    Equivalent: 9 - qcut(..., labels=False).
+    Uses rank(method="first") so ties are broken deterministically — this ALWAYS
+    yields all 10 classes when len(fwd) >= 10, unlike qcut(duplicates="drop")
+    which silently produces fewer bins (and a missing class) when returns tie
+    (e.g. many delisting/illiquid zeros).  XGBoost multi:softprob with num_class=10
+    requires every class to appear, so this robustness matters.
     """
-    fwd = rets.iloc[t].dropna()
-    return (9 - pd.qcut(fwd, 10, labels=False, duplicates="drop")).astype(int)
+    fwd = fwd.dropna()
+    r   = fwd.rank(method="first")                       # 1..n ascending
+    asc = (((r - 1) * 10 // len(r)).clip(upper=9)).astype(int)   # 0=lowest … 9=highest
+    return (9 - asc).astype(int)                         # 0=highest return
+
+
+def make_labels(rets: pd.DataFrame, t: int) -> pd.Series:
+    """Next-month cross-sectional return deciles over the full cross-section."""
+    return _decile_labels(rets.iloc[t].dropna())
 
 
 # ── 4. XGBoost ensemble ───────────────────────────────────────────────────────
@@ -257,14 +267,10 @@ def backtest(csv_path=None):
     pool = {}   # t → (features DataFrame, labels Series)
     for t in range(first_feat, T):
         F   = make_features(rets, size, t).dropna()
-        L   = make_labels(rets, t)
-        idx = (
-            F.index
-             .intersection(L.index)
-             .intersection(rets.iloc[t].dropna().index)
-        )
+        idx = F.index.intersection(rets.iloc[t].dropna().index)
         if len(idx) >= 20:
-            pool[t] = (F.loc[idx], L.loc[idx])
+            L = _decile_labels(rets.iloc[t].reindex(idx))   # deciles within trained set
+            pool[t] = (F.loc[idx], L)
 
     results     = {k: {"ls": [], "lo": []} for k in ("bench", "dpr", "ret", "srp")}
     model_store = {}   # year → (models, mu_k, sigma2_k)
@@ -362,6 +368,148 @@ def backtest(csv_path=None):
         print()
 
     return results
+
+
+def compute_eligibility(
+    prices_monthly: pd.DataFrame,
+    size_monthly: pd.DataFrame | None = None,
+    min_price: float = 5.0,
+    min_coverage: float = 0.70,
+    window: int = 36,
+    min_history: int = 12,
+    min_dollar_vol_pct: float = 0.0,
+    min_dollar_vol_abs: float = 5e6,
+) -> pd.DataFrame:
+    """
+    Point-in-time (causal) tradeability / liquidity mask — NO look-ahead.
+
+    A stock is eligible at month t iff, using ONLY data up to and including t:
+      1. current price > min_price (penny-stock floor), AND
+      2. price > min_price in ≥ min_coverage of the trailing window months
+         (requires ≥ min_history valid months), AND
+      3. (if size_monthly given) trailing 3-month average dollar volume is BOTH:
+           a. in the top (1 − min_dollar_vol_pct) percentile cross-sectionally, AND
+           b. above min_dollar_vol_abs in absolute terms.
+         The absolute floor prevents the relative filter from admitting illiquid
+         micro-caps when the whole cross-section has low liquidity (e.g. 2001–2003).
+
+    All rules use strictly backward rolling windows → no look-ahead.
+    Evaluate at signal date (t−1) to get the point-in-time eligible universe.
+
+    Returns T×N boolean DataFrame aligned to prices_monthly.
+    """
+    valid   = prices_monthly.notna()
+    good_px = (prices_monthly > min_price) & valid
+    n_valid = valid.rolling(window, min_periods=min_history).sum()
+    n_good  = good_px.rolling(window, min_periods=min_history).sum()
+    cov     = n_good / n_valid.clip(lower=1)
+    elig    = (cov >= min_coverage) & (prices_monthly > min_price) & (n_valid >= min_history)
+
+    if size_monthly is not None:
+        # 3-month trailing average dollar volume (point-in-time, causal)
+        dv = size_monthly.reindex_like(prices_monthly).rolling(3, min_periods=1).mean()
+        if min_dollar_vol_pct > 0:
+            rank = dv.rank(axis=1, pct=True)
+            elig = elig & (rank >= min_dollar_vol_pct)
+        if min_dollar_vol_abs > 0:
+            elig = elig & (dv >= min_dollar_vol_abs)
+
+    return elig.fillna(False)
+
+
+def _build_pnl_prices(
+    prices_monthly: pd.DataFrame,
+    lo: float = -0.95,
+    hi: float = 3.0,
+) -> pd.DataFrame:
+    """
+    Price series for PnL with realised returns cleaned the same way the modelling
+    returns are (Han §4.1): per-cell clip to [lo, hi] (kills split/feed data errors
+    on the upside, keeps real crashes on the downside) then cross-sectional 1/99
+    winsorisation each month.  A synthetic price path is rebuilt from the cleaned
+    returns (levels are arbitrary; only ratios matter for PnL) and the original
+    NaN structure is restored so the traded universe / features are unaffected.
+
+    Without this, routing PnL through raw prices lets a single untradeable penny
+    pop (+1000%/month) detonate the short side — the realistic universe filter
+    handles most of it, this caps the residual data-error tail.
+    """
+    r    = prices_monthly.pct_change().clip(lower=lo, upper=hi)
+    qlo  = r.quantile(0.01, axis=1)
+    qhi  = r.quantile(0.99, axis=1)
+    r    = r.clip(qlo, qhi, axis=0)
+    synth = (1.0 + r.fillna(0.0)).cumprod()
+    return synth.where(prices_monthly.notna())
+
+
+def _inject_delisting_returns(
+    prices_monthly: pd.DataFrame,
+    delist_return: float = -0.30,
+) -> pd.DataFrame:
+    """
+    Make delistings cost money.
+
+    The backtest core treats a NaN return as 0, so a held name that simply
+    disappears from the price matrix books a 0% return instead of its loss —
+    silently amputating crash/short-squeeze risk (the same flaw the old ±50%
+    clip had).  Here, for every column whose last valid price is before the end
+    of the sample, we write ONE synthetic price at the following month equal to
+    last_price * (1 + delist_return).  pct_change then realises the delisting
+    return in the month after the last trade; the position is closed at the next
+    rebalance (price is NaN thereafter).
+
+    -30% is the Beaver-McNichols-Price (2007) / Han (2022 §4.1) fallback used
+    when a CRSP delist return is unavailable.  The index is unchanged (we only
+    fill an existing, previously-NaN cell), so weight/price date alignment holds.
+    """
+    px   = prices_monthly.copy()
+    idx  = px.index
+    last = len(idx) - 1
+    for col in px.columns:
+        s  = px[col]
+        lv = s.last_valid_index()
+        if lv is None:
+            continue
+        pos = idx.get_loc(lv)
+        if pos < last:                       # stopped trading before sample end → delisted
+            px.iloc[pos + 1, px.columns.get_loc(col)] = s.iloc[pos] * (1.0 + delist_return)
+    return px
+
+
+def fetch_tiingo_monthly(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    api_key: str = "102cb09d2f83b832d38f00437fd18de26e025d95",
+) -> pd.DataFrame:
+    """
+    Fetch a single ticker's monthly adjusted-close series from Tiingo.
+
+    Returns a one-column DataFrame named `ticker`, month-end indexed.  Used for the
+    SPY buy-and-hold benchmark so the whole pipeline depends only on Tiingo (no
+    yfinance).  Raises on network/HTTP failure so a silent empty benchmark can't
+    slip into the comparison.
+    """
+    import requests
+    url = (
+        f"https://api.tiingo.com/tiingo/daily/{ticker}/prices"
+        f"?startDate={start_date}&endDate={end_date}"
+        f"&resampleFreq=monthly&token={api_key}"
+    )
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        raise ValueError(f"Tiingo returned no data for {ticker} ({start_date}–{end_date}).")
+    df = pd.DataFrame(data)
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+    out = df.set_index("date")[["adjClose"]].rename(columns={"adjClose": ticker})
+    out.index = pd.to_datetime(out.index)
+    return out.sort_index()
 
 
 def load_broad_universe_tiingo(
@@ -520,33 +668,40 @@ def load_broad_universe_tiingo(
     close_wide.index  = pd.to_datetime(close_wide.index)
     volume_wide.index = pd.to_datetime(volume_wide.index)
 
-    # Coverage filter: fraction of the stock's own active months with price > min_price.
-    # A stock active 2005-2010 only needs 70% of THOSE months, not 70% of all 318.
-    # This preserves delisted stocks for survivorship-bias-free analysis.
-    has_price  = close_wide > min_price
-    n_active   = has_price.notna().sum()          # months where row exists
-    n_good_px  = (has_price == True).sum()        # months with price > min_price
-    # Require at least 12 months of data AND min_coverage within active window
-    good       = (n_active >= 12) & (n_good_px / n_active.clip(lower=1) >= min_coverage)
-    close_wide  = close_wide.loc[:, good]
-    volume_wide = volume_wide.reindex(columns=close_wide.columns)
-
+    # ── Universe filter — POINT-IN-TIME, no look-ahead ───────────────────────
+    # The old filter kept a stock if price>min in ≥X% of *all* its months — that
+    # uses future prices to decide today's membership (look-ahead/survivorship).
+    # Here we only drop columns that can never form a feature (<12 valid months
+    # anywhere).  The real, time-varying coverage/price test is applied causally
+    # at portfolio-formation time via compute_eligibility().  Delisted names are
+    # kept → survivorship-bias-free.
+    n_valid_ever = close_wide.notna().sum()
+    keep         = n_valid_ever >= 12
+    close_wide   = close_wide.loc[:, keep]
+    volume_wide  = volume_wide.reindex(columns=close_wide.columns)
     if verbose:
-        print(f"[tiingo] kept {good.sum():,}/{len(good):,} tickers "
-              f"(≥12 months data, price≥${min_price} in ≥{min_coverage:.0%} of active months)")
+        print(f"[tiingo] kept {int(keep.sum()):,}/{len(keep):,} tickers "
+              f"(≥12 valid months ever; point-in-time coverage applied at trade time)")
 
-    prices_monthly = close_wide
+    prices_raw     = close_wide
     volume_monthly = volume_wide
-    # Return cleaning (paper §4.1): drop data errors (>+300% / <-95%), then winsorize
-    # at the CROSS-SECTIONAL 1/99 percentile each month.  Unlike a fixed ±50% clip,
-    # this stays wide during momentum-crash months (when many losers rebound together),
-    # so the short-side crash risk that should punish raw momentum is preserved.
-    _raw           = prices_monthly.pct_change()
-    _raw           = _raw.mask((_raw > 3.0) | (_raw < -0.95))
-    _lo            = _raw.quantile(0.01, axis=1)
-    _hi            = _raw.quantile(0.99, axis=1)
-    rets_monthly   = _raw.clip(_lo, _hi, axis=0)
-    size_monthly   = (prices_monthly * volume_monthly).ffill()
+
+    # Inject explicit delisting returns FIRST so rets_monthly and pnl_prices
+    # share the same source.  A name whose last real price is before sample end
+    # gets a synthetic price at pos+1 = last_price * 0.70 (−30% Han §4.1 fallback).
+    # Using this as the base for rets_monthly means training labels SEE the −30%
+    # and learn it → bottom decile; PnL books the same loss.  Consistent.
+    prices_monthly = _inject_delisting_returns(prices_raw, delist_return=-0.30)
+
+    # Returns for features / labels / decile means.  >+300% = upside data error → NaN.
+    # Downside kept; cross-sectional 1/99 winsorization each month.
+    _raw         = prices_monthly.pct_change()
+    _raw         = _raw.mask(_raw > 3.0)
+    _lo          = _raw.quantile(0.01, axis=1)
+    _hi          = _raw.quantile(0.99, axis=1)
+    rets_monthly = _raw.clip(_lo, _hi, axis=0)
+
+    size_monthly = (prices_raw * volume_monthly).ffill()
 
     if verbose:
         print(f"[tiingo] monthly prices : {prices_monthly.shape}  "
@@ -671,14 +826,10 @@ def generate_dm_weights(
     pool = {}
     for t in range(first_feat, T - 1):
         F   = make_features(rets, size, t, ffd_scores=None).dropna()
-        L   = make_labels(rets, t)
-        idx = (
-            F.index
-             .intersection(L.index)
-             .intersection(rets.iloc[t].dropna().index)
-        )
+        idx = F.index.intersection(rets.iloc[t].dropna().index)
         if len(idx) >= 20:
-            pool[t] = (F.loc[idx], L.loc[idx])
+            L = _decile_labels(rets.iloc[t].reindex(idx))   # deciles within trained set
+            pool[t] = (F.loc[idx], L)
 
     weight_rows = {}   # signal_date → pd.Series of weights
     model_store = {}   # year → (models, mu_k, sigma2_k)
@@ -904,10 +1055,13 @@ def _bench_weights(
     min_train_months: int = MIN_TRAIN_YRS * 12,
     use_ffd: bool = True,
     ffd_scores: dict | None = None,
+    eligible: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Cross-sectional momentum long(/short) — no XGBoost.
     ffd_scores: pre-computed FFD scores (skips re-estimation if provided).
+    eligible  : point-in-time tradeability mask (compute_eligibility); applied at
+                the signal date t-1 so the traded universe has no look-ahead.
     """
     T          = len(rets)
     first_feat = max(MOM_WINDOWS) + 1
@@ -925,6 +1079,9 @@ def _bench_weights(
 
     for t in range(first_pred, T - 1):
         F = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
+        if eligible is not None:
+            e = eligible.iloc[t - 1]
+            F = F.loc[F.index.intersection(e.index[e.values])]
         if len(F) < 20:
             continue
         signal_date = rets.index[t - 1]
@@ -950,16 +1107,19 @@ def _generate_all_dm_weights(
     portfolio: str = "ls",
     q: float = TOP_Q,
     min_train_months: int = MIN_TRAIN_YRS * 12,
-    max_train_months: int = 60,
+    max_train_months: int | None = 60,
     n_seeds: int = N_SEEDS,
     use_ffd: bool = True,
     ffd_scores: dict | None = None,
     pool: dict | None = None,
+    eligible: pd.DataFrame | None = None,
 ) -> dict:
     """
     Train XGBoost (rolling window), then score DPR / RET / SRP.
-    max_train_months: cap on training window size (rolling, not expanding).
+    max_train_months: int = rolling cap (default 60); None = expanding window (paper §4.1).
     ffd_scores / pool: pass pre-computed values to skip recomputation.
+    eligible: point-in-time tradeability mask (compute_eligibility), applied at the
+              signal date t-1 to both the training pool and the traded universe.
     """
     T          = len(rets)
     first_feat = max(MOM_WINDOWS) + 1
@@ -978,14 +1138,16 @@ def _generate_all_dm_weights(
         pool = {}
         for t in range(first_feat, T - 1):
             F   = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
-            L   = make_labels(rets, t)
-            idx = (
-                F.index
-                 .intersection(L.index)
-                 .intersection(rets.iloc[t].dropna().index)
-            )
+            idx = F.index.intersection(rets.iloc[t].dropna().index)
+            if eligible is not None:
+                e   = eligible.iloc[t - 1]
+                idx = idx.intersection(e.index[e.values])
             if len(idx) >= 20:
-                pool[t] = (F.loc[idx], L.loc[idx])
+                # Deciles computed WITHIN the trained (eligible) cross-section → all
+                # 10 classes present (a global decile rank could leave the subset
+                # missing an extreme class and break XGBoost num_class=10).
+                L = _decile_labels(rets.iloc[t].reindex(idx))
+                pool[t] = (F.loc[idx], L)
 
     rows        = {"ret": {}}
     model_store = {}
@@ -1036,7 +1198,7 @@ def _generate_all_dm_weights(
         for t in months:
             if t not in pool:
                 continue
-            F = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
+            F, _ = pool[t]   # same cross-section used for training; no re-computation
             if len(F) < 20:
                 continue
             signal_date = rets.index[t - 1]
@@ -1108,110 +1270,29 @@ def apply_partial_adjustment(
     return pd.DataFrame(out).T.reindex(columns=cols).fillna(0.0)
 
 
-def _monthly_ls_backtest(
-    weights: pd.DataFrame,
-    rets: pd.DataFrame,
-    *,
-    transaction_cost: float = 0.001,
-    freq: int = 12,
-) -> dict:
-    """
-    Direct monthly L/S portfolio backtest — no daily drift, no leverage blowup.
-
-    weights : DataFrame indexed by signal dates (month-end of t-1).
-              Each row should have long weights summing to +1 and short to -1.
-    rets    : Monthly returns DataFrame, indexed by month-end of t.
-
-    For each signal date the portfolio is held during the NEXT calendar month,
-    using that month's realised returns.  Transaction cost is applied as a
-    fraction of one-way notional traded (weight changes vs. previous period).
-    """
-    port_rets: list[float] = []
-    dates:     list[pd.Timestamp] = []
-    turnovers: list[float] = []
-    w_prev: pd.Series | None = None
-
-    for sig_date in weights.index:
-        pos = rets.index.searchsorted(sig_date, side="right")
-        if pos >= len(rets):
-            continue
-        hold_date = rets.index[pos]
-
-        w = weights.loc[sig_date]
-        r = rets.loc[hold_date].reindex(w.index).fillna(0.0)
-
-        port_r = float((w * r).sum())
-
-        # one-way turnover relative to previous portfolio
-        if w_prev is not None:
-            delta = (w - w_prev.reindex(w.index, fill_value=0.0)).abs().sum()
-            one_way = 0.5 * float(delta)
-            turnovers.append(one_way)
-            port_r -= transaction_cost * one_way
-
-        w_prev = w.copy()
-        dates.append(hold_date)
-        port_rets.append(port_r)
-
-    if not dates:
-        raise ValueError("_monthly_ls_backtest: no valid holding months found.")
-
-    returns  = pd.Series(port_rets, index=pd.DatetimeIndex(dates), name="returns")
-    equity   = (1 + returns).cumprod()
-    drawdown = equity / equity.cummax() - 1
-
-    n          = len(returns)
-    ann_return = float(equity.iloc[-1] ** (freq / n) - 1.0)
-    ann_vol    = float(returns.std() * np.sqrt(freq))
-    sharpe     = ann_return / ann_vol if ann_vol > 0 else np.nan
-    max_dd     = float(drawdown.min())
-    avg_dd     = float(drawdown[drawdown < 0].mean()) if (drawdown < 0).any() else 0.0
-    ann_to     = float(np.mean(turnovers) * freq) if turnovers else np.nan
-    total_ret  = float(equity.iloc[-1] - 1.0)
-
-    return {
-        "returns":           returns,
-        "equity":            equity,
-        "drawdown":          drawdown,
-        "ann_return":        ann_return,
-        "ann_vol":           ann_vol,
-        "sharpe":            sharpe,
-        "max_drawdown":      max_dd,
-        "avg_drawdown":      avg_dd,
-        "total_return":      total_ret,
-        "ann_turnover":      ann_to,
-        # placeholder keys expected by results_backtest summary table
-        "cdar":              np.nan,
-        "cvar_ann":          np.nan,
-        "downside_deviation": np.nan,
-        "mrc_variance":      np.nan,
-        "herfindahl":        np.nan,
-        "expectancy":        np.nan,
-        "total_cost":        np.nan,
-    }
-
-
 def compare_strategies(
     preloaded: tuple,
     *,
     n_seeds: int = N_SEEDS,
     min_train_months: int = MIN_TRAIN_YRS * 12,
-    max_train_months: int = 60,
+    max_train_months: int | None = 60,
     q: float = TOP_Q,
     transaction_cost: float = 0.001,
+    min_dollar_vol_pct: float = 0.0,
+    min_dollar_vol_abs: float = 5e6,
     save_fig: str = "dm_comparison_tiingo.png",
 ) -> dict:
     """
-    Run Bench (zMOM12 L/S), DM-DPR, DM-RET, DM-SRP L/S plus SPY B&H.
-    preloaded : (prices_monthly, rets_monthly, size_monthly) from load_broad_universe_tiingo()
-    Returns dict  label → backtest result dict.
+    Run Bench (zMOM12 L/S), DM-RET, DM-GP L/S plus SPY B&H.
+    preloaded          : (prices_monthly, rets_monthly, size_monthly) from load_broad_universe_tiingo()
+    min_dollar_vol_pct : relative liquidity filter (0 = off, 0.7 = keep top 30%).
+    min_dollar_vol_abs : absolute monthly dollar-volume floor (default $1M).
     """
     import matplotlib
     matplotlib.use("Agg")
 
     try:
         import BACKTEST
-        import yfinance as yf
     except ImportError as e:
         raise ImportError(str(e))
 
@@ -1220,12 +1301,25 @@ def compare_strategies(
     data_start = rets_monthly.index[0]
     data_end   = rets_monthly.index[-1]
 
+    # Point-in-time tradeability + liquidity mask (causal).
+    eligible = compute_eligibility(
+        prices_monthly, size_monthly,
+        min_dollar_vol_pct=min_dollar_vol_pct,
+        min_dollar_vol_abs=min_dollar_vol_abs,
+    )
+    print(f"[eligibility] avg tradeable names/month: "
+          f"{eligible.loc[rets_monthly.index].sum(axis=1).iloc[min_train_months:].mean():.0f}")
+
+    # Cleaned price series for PnL (winsorised realised returns + delisting),
+    # so a single untradeable data-error move can't detonate the book.
+    pnl_prices = _build_pnl_prices(prices_monthly)
+
     # ── 2. Bench weights (raw zMOM12 L/S) ────────────────────────────────────
     print("\n── Bench zMOM12 L/S ─────────────────────────────────────────────────")
     bench_w = _bench_weights(
         rets_monthly, size_monthly, prices_monthly,
         min_train_months=min_train_months, q=q, use_ffd=False,
-        portfolio="ls",
+        portfolio="ls", eligible=eligible,
     )
 
     # ── 3. DM weights (momentum + dynamics + FFD features) ───────────────────
@@ -1236,28 +1330,37 @@ def compare_strategies(
         rets_monthly, size_monthly, prices_monthly,
         min_train_months=min_train_months, max_train_months=max_train_months,
         q=q, n_seeds=n_seeds, use_ffd=True,
-        portfolio="ls", pool=None,
+        portfolio="ls", pool=None, eligible=eligible,
     )
 
-    # ── 4. SPY download ──────────────────────────────────────────────────────
-    spy_raw = yf.download(
+    # ── 4. SPY benchmark (Tiingo — same source as the universe) ──────────────
+    spy_prices = fetch_tiingo_monthly(
         "SPY",
-        start=data_start.strftime("%Y-%m-%d"),
-        end=(data_end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-        auto_adjust=True, progress=False,
+        data_start.strftime("%Y-%m-%d"),
+        data_end.strftime("%Y-%m-%d"),
     )
-    # yfinance may return MultiIndex (metric, ticker) or flat columns depending on version
-    spy_close = spy_raw["Close"]
-    if isinstance(spy_close, pd.DataFrame):
-        spy_close = spy_close.iloc[:, 0]
-    spy_prices = spy_close.to_frame("SPY")
-    spy_prices.index = pd.to_datetime(spy_prices.index)
 
-    # ── 5. Backtest each strategy (monthly, no daily drift) ──────────────────
-    # Use _monthly_ls_backtest to avoid gross-leverage blowup from daily drift
-    # between monthly rebalances (the drift mode allows leverage > 2× to accumulate).
+    # ── 5. Backtest each strategy THROUGH THE MAIN ENGINE (BACKTEST.py) ──────
+    # Monthly bars + rebalance every month (signal_dates = every weight date) +
+    # lag=0 → weights from signal at month m earn the return m→m+1 (the month
+    # AFTER the signal: no look-ahead).  Rebalancing every period resets the book,
+    # so the daily-drift gross-leverage blow-up that motivated the old standalone
+    # backtester cannot occur — one engine, one timing convention.
     all_results = {}
     oos_start_ref = None
+
+    def _run_engine(weights: pd.DataFrame, prices_m: pd.DataFrame, tc: float) -> dict:
+        first = weights.index[0]
+        px_bt = prices_m.loc[first:]                     # trim → correct annualisation
+        sigs  = [d for d in weights.index if d in px_bt.index]
+        w_bt  = weights.reindex(columns=px_bt.columns).fillna(0.0)
+        return BACKTEST.backtest(
+            w_bt, px_bt,
+            freq=12, lag=0,
+            transaction_cost=tc,
+            signal_dates=sigs,
+            compute_risk_metrics=False,
+        )
 
     #   DM       DM-RET reclassification (Σ pₖμₖ), equal-weight decile L/S
     #   DM-GP    DM + Gârleanu–Pedersen partial adjustment (delta=0.5)
@@ -1278,45 +1381,22 @@ def compare_strategies(
             f"\n  [{label}]  {oos_start.date()} – {raw_w.index[-1].date()}"
             f"  |  {n_months} signal months  |  {n_tickers} active tickers"
         )
-        res = _monthly_ls_backtest(
-            raw_w, rets_monthly,
-            transaction_cost=transaction_cost,
-            freq=12,
-        )
+        res = _run_engine(raw_w, pnl_prices, transaction_cost)
         res["name"] = label
         all_results[label] = res
 
-    # SPY B&H — monthly, aligned to first HOLDING month (one past signal date)
-    spy_monthly = spy_prices.resample("ME").last().pct_change().dropna()
-    spy_monthly.columns = ["SPY"]
-    spy_oos_pos = spy_monthly.index.searchsorted(oos_start_ref, side="right")
-    spy_ret_oos = spy_monthly.iloc[spy_oos_pos:]["SPY"]
-    spy_equity  = (1 + spy_ret_oos).cumprod()
-    spy_dd      = spy_equity / spy_equity.cummax() - 1
-    n_spy       = len(spy_ret_oos)
-    spy_ann_ret = float(spy_equity.iloc[-1] ** (12 / n_spy) - 1.0) if n_spy > 0 else np.nan
-    spy_ann_vol = float(spy_ret_oos.std() * np.sqrt(12))
-    spy_sharpe  = spy_ann_ret / spy_ann_vol if spy_ann_vol > 0 else np.nan
-    spy_res = {
-        "name":              "S&P 500 B&H",
-        "returns":           spy_ret_oos,
-        "equity":            spy_equity,
-        "drawdown":          spy_dd,
-        "ann_return":        spy_ann_ret,
-        "ann_vol":           spy_ann_vol,
-        "sharpe":            spy_sharpe,
-        "max_drawdown":      float(spy_dd.min()),
-        "avg_drawdown":      float(spy_dd[spy_dd < 0].mean()) if (spy_dd < 0).any() else 0.0,
-        "total_return":      float(spy_equity.iloc[-1] - 1.0),
-        "ann_turnover":      0.0,
-        "cdar":              np.nan,
-        "cvar_ann":          np.nan,
-        "downside_deviation": np.nan,
-        "mrc_variance":      np.nan,
-        "herfindahl":        np.nan,
-        "expectancy":        np.nan,
-        "total_cost":        0.0,
-    }
+    # SPY B&H — also through BACKTEST.py: one rebalance at the start, then hold.
+    spy_monthly_px = spy_prices.resample("ME").last()
+    spy_bt         = spy_monthly_px.loc[oos_start_ref:]
+    spy_w          = pd.DataFrame(1.0, index=[spy_bt.index[0]], columns=["SPY"])
+    spy_res        = BACKTEST.backtest(
+        spy_w, spy_bt,
+        freq=12, lag=0,
+        transaction_cost=0.0,
+        signal_dates=[spy_bt.index[0]],
+        compute_risk_metrics=False,
+    )
+    spy_res["name"] = "S&P 500 B&H"
     all_results["S&P 500 B&H"] = spy_res
 
     # ── 6. Comparison table + equity chart ───────────────────────────────────
@@ -1354,7 +1434,7 @@ if __name__ == "__main__":
         ckpt_exists = os.path.exists("tiingo_download_checkpoint.parquet")
         print(f"\n[tiingo] Loading broad universe (start={start_yr}, seeds={seeds}) …")
         data = load_broad_universe_tiingo(start_date=start_yr, skip_download=ckpt_exists)
-        compare_strategies(data, n_seeds=seeds, max_train_months=60)
+        compare_strategies(data, n_seeds=seeds, max_train_months=60)  # rolling 60m window
 
     elif args and os.path.isfile(args[0]) and args[0].endswith(".csv"):
         # CSV archive pipeline: python deep_momentum_xgb.py all_stocks_5yr.csv srp ls

@@ -3,32 +3,39 @@
 Replication/extension of Han (2022), *Bimodal Characteristic Returns and Predictability
 Enhancement via Machine Learning*, using XGBoost in place of the paper's DNN.
 
-**Universe:** survivorship-bias-free Tiingo broad US equities, 808 tickers passing the
-coverage filter, monthly 2000-01 – 2026-06. **OOS test:** 2011-01 – 2026-04.
-**Construction:** equal-weight L/S, top/bottom 5%, rolling 60-month window, annual
-retrain, 5-seed ensemble, time-blocked validation. Returns net of 10bp transaction cost.
+**Universe:** survivorship-bias-free Tiingo broad US equities, monthly 2000-01 – 2026-06.
+**OOS test:** 2011-01 – 2026-04 (184 signal months). **Construction:** equal-weight L/S,
+top/bottom 5%, rolling 60-month window, annual retrain, 5-seed ensemble, time-blocked
+validation. Returns net of 10bp transaction cost.
 
-## Final pipeline (the champion)
+**Engine & leakage controls:**
+- Single engine: `BACKTEST.backtest` (`freq=12`, `lag=0`). Signal at month-end *m* → earns return *m→m+1*. No look-ahead.
+- **Point-in-time eligibility** (`compute_eligibility`): price>$5, ≥70% coverage over trailing 36 months, top 30% by dollar volume cross-sectionally, **and** absolute floor ≥$1M/month.
+- **Delistings book −30%** (Han §4.1) via synthetic price at pos+1; `rets_monthly` derived from the same delist-adjusted prices so training labels and PnL are consistent.
+- **OOS prediction cross-section = training cross-section** (`pool[t][0]`).
+
+## Final pipeline
 
 1. **Features (32):** 5 nMOM + 5 MMOM (paper Eq. 6-8) + ACCEL/VOL/POS momentum-dynamics
-   + 6 FFD (López de Prado, AFML Ch. 5: uniform-d FFD level + ΔFFD slopes, leakage-free —
-   d frozen on the pre-OOS training window, causal FIR filter) + 10 SIZE dummies.
-2. **Model:** XGBoost `multi:softprob` 10-class classifier (return deciles), ensembled over seeds.
-3. **Reclassification:** RET = Σ pₖμₖ (law of total expectation) — the paper's best/most-robust criterion.
-4. **Turnover control:** Gârleanu–Pedersen partial adjustment wₜ=(1−δ)wₜ₋₁+δw*ₜ, δ=0.5 (quadratic-cost-optimal).
+   + 6 FFD (uniform-d, causal FIR, d frozen on initial training window) + 10 SIZE dummies.
+2. **Model:** XGBoost `multi:softprob` 10-class, ensembled over seeds.
+3. **Reclassification:** RET = Σ pₖμₖ (law of total expectation).
+4. **Turnover control:** Gârleanu–Pedersen partial adjustment wₜ=(1−δ)wₜ₋₁+δw\*ₜ, δ=0.5.
 
 ## Headline comparison (OOS 2011–2026)
 
+*5-seed ensemble. Universe avg ~561 tradeable names/month (top 30% by dollar volume, ≥$1M/month floor, price>$5).*
+
 | Strategy | Ann. Return | Sharpe | Max DD | Ann. Vol | Ann. Turnover |
 |---|---|---|---|---|---|
-| Bench zMOM12 L/S (raw momentum) | 16.4% | 0.77 | −49.1% | 21.2% | 683% |
-| DM L/S (RET reclassification) | 29.7% | 1.62 | −19.8% | 18.4% | 1476% |
-| **DM-GP L/S (champion)** | 31.4% | **2.29** | **−15.2%** | 13.7% | 791% |
-| S&P 500 B&H | 13.9% | 0.98 | −23.9% | 14.2% | 0% |
+| Bench zMOM12 L/S | 22.6% | 0.89 | −51.4% | 27.4% | 898% |
+| **DM L/S** (RET reclassification) | **22.6%** | **1.11** | **−21.6%** | 20.3% | 1672% |
+| DM-GP L/S (δ=0.5) | 18.6% | 1.07 | −21.5% | 17.4% | 894% |
+| S&P 500 B&H | 13.9% | 0.99 | −23.9% | 14.2% | 3% |
 
-*(Headline table under xgboost 3.3.0. The experiment-by-experiment deltas quoted in the
-thesis below were measured under xgboost 1.7.6 — DM 1.41, DM-GP 2.25; the upgrade nudged
-levels up slightly but left every ranking and conclusion unchanged.)*
+**Key finding:** DM's edge over the raw momentum bench is **risk reduction, not return enhancement** — same 22.6% return but vol cut from 27% to 20% and max DD from −51% to −22%. The bimodality crash is dramatically compressed. GP at δ=0.5 over-smooths in this liquid universe: α-decay (−4pp return) exceeds the transaction-cost saving from halved turnover; deriving δ from the signal autocorrelation (φ=0.65) is the principled next step.
+
+*(Previous stale headline — leaky pipeline, micro-cap universe, standalone backtester — showed Bench 0.77 / DM 1.62 / DM-GP 2.29. Tighter eligibility and pipeline fixes brought these to more credible levels.)*
 
 ---
 
@@ -91,7 +98,14 @@ now shown to be unreliable.
 ## Caveats (before any live consideration)
 
 - 5-seed ensemble — needs a 20-seed confirm before trusting the Sharpe levels.
-- The universe coverage filter (price>$1 in ≥70% of life) is computed over the full sample
-  → residual survivorship bias inflates the *levels* (the *gaps* are likely real).
-- Turnover ~790% is still well above the paper's 166%; not yet live-tradeable.
+- ~~Universe coverage filter computed over full sample → survivorship bias.~~ **Fixed:**
+  membership now uses point-in-time causal eligibility (trailing-window coverage at the
+  signal date). Levels should drop somewhat once re-run.
+- ~~Delisting/crash returns silently zeroed → optimistic short-side / crash-immunity.~~
+  **Fixed:** delistings now book −30% in the price series, captured by the engine.
+- ~~Headline produced by a standalone backtester, not the main engine.~~ **Fixed:** all
+  PnL routes through `BACKTEST.backtest` (monthly, `lag=0`).
+- Turnover ~790% (old number) is still well above the paper's 166%; not yet live-tradeable.
 - `size` is a dollar-volume proxy, not true market cap.
+- Delisting return is a flat −30% fallback (no CRSP delist returns in Tiingo monthly);
+  a name truncated for benign data reasons is also charged −30%, a mild conservative bias.

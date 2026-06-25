@@ -5,3 +5,6 @@ __pycache__/
 *.nbi
 *_yf_cache.parquet
 *.parquet
+
+# logs
+*.log
