@@ -1255,36 +1255,6 @@ def _weights_to_daily(weights: pd.DataFrame, prices_daily: pd.DataFrame) -> tupl
     return w, mapped_index
 
 
-def apply_partial_adjustment(
-    weights: pd.DataFrame, delta: float = 0.5, gross: float = 2.0
-) -> pd.DataFrame:
-    """
-    Gârleanu–Pedersen partial adjustment (quadratic-cost-optimal turnover control).
-
-    Optimal policy under quadratic (market-impact) costs is to trade only a
-    fraction of the gap toward the target each period:
-        w~_t = (1 - delta) * w~_{t-1} + delta * w*_t
-    then renormalize the row to constant gross exposure (sum|w| = gross), which
-    preserves dollar-neutrality (both inputs are net-zero → scaled combo is net-zero).
-
-    delta in (0,1]:  1 = trade fully to target (= original strategy);
-                     smaller delta = slower adjustment = lower turnover, mild alpha decay.
-    The GP closed form sets delta from the cost/risk ratio:
-        lambda*delta^2 + gamma*Sigma*delta - gamma*Sigma = 0.
-    Here delta is exposed as a tunable knob (default 0.5 ≈ trade halfway each month).
-    """
-    cols   = weights.columns
-    out    = {}
-    w_prev = pd.Series(0.0, index=cols)
-    for date, w_target in weights.iterrows():
-        w = (1.0 - delta) * w_prev + delta * w_target
-        s = w.abs().sum()
-        if s > 0:
-            w = w * (gross / s)          # hold gross constant; net-zero preserved
-        out[date]  = w
-        w_prev     = w
-    return pd.DataFrame(out).T.reindex(columns=cols).fillna(0.0)
-
 
 def compare_strategies(
     preloaded: tuple,
@@ -1299,7 +1269,7 @@ def compare_strategies(
     save_fig: str = "dm_comparison_tiingo.png",
 ) -> dict:
     """
-    Run Bench (zMOM12 L/S), DM-RET, DM-GP L/S plus SPY B&H.
+    Run Bench (zMOM12 L/S), DM-RET L/S plus SPY B&H.
     preloaded          : (prices_monthly, rets_monthly, size_monthly) from load_broad_universe_tiingo()
     min_dollar_vol_pct : relative liquidity filter (0 = off, 0.7 = keep top 30%).
     min_dollar_vol_abs : absolute monthly dollar-volume floor (default $1M).
@@ -1387,13 +1357,10 @@ def compare_strategies(
         )
 
     #   DM       DM-RET reclassification (Σ pₖμₖ), equal-weight decile L/S
-    #   DM-GP    DM + Gârleanu–Pedersen partial adjustment (delta=0.5)
     dm     = dm_w["ret"]
-    dm_gp  = apply_partial_adjustment(dm, delta=0.5)
     for label, raw_w in [
         ("Bench zMOM12 L/S",  bench_w),   # raw momentum benchmark
         ("DM L/S",            dm),        # DM-RET reclassification
-        ("DM-GP L/S",         dm_gp),     # DM + GP turnover control
     ]:
         oos_start = raw_w.index[0]
         if oos_start_ref is None:
