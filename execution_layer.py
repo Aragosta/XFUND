@@ -62,6 +62,28 @@ def estimate_signal_decay(signals: pd.DataFrame, method: str = "acf1") -> np.nda
     raise ValueError(f"Unknown method: {method}")
 
 
+def rolling_signal_decay(
+    signals: pd.DataFrame,
+    window: int = 24,
+) -> pd.Series:
+    """
+    Rolling ACF1 estimate of signal persistence φ, using only past data.
+
+    At each date t, φ is estimated from the previous `window` rows — fully
+    causal, no look-ahead. Returns a Series indexed by the signal dates
+    (first value available at index `window - 1`).
+
+    Used to feed time-varying φ into DynTrad so the trading rate adapts
+    to momentum-crash regimes (where φ collapses from ~0.65 to ~0.2).
+    """
+    phi_vals = {}
+    idx = signals.index
+    for i in range(window, len(signals) + 1):
+        window_slice = signals.iloc[i - window : i]
+        phi_vals[idx[i - 1]] = float(estimate_signal_decay(window_slice).mean())
+    return pd.Series(phi_vals)
+
+
 def estimate_cost_matrix(
     dollar_volume: pd.DataFrame,
     base_cost_bps: float = 10.0,
@@ -249,6 +271,45 @@ class DynTrad:
 
         return pd.DataFrame(positions, index=cols).T
 
+    def run_rolling(
+        self,
+        signal_df: pd.DataFrame,
+        phi_series: pd.Series,
+    ) -> pd.DataFrame:
+        """
+        Run DynTrad with a time-varying φ (rolling ACF1 estimate).
+
+        At each date, if a φ estimate is available, re-derives a, δ, and
+        aim_weights before applying step(). This lets the trading rate
+        adapt to regime changes (momentum crash → φ drops → trade faster).
+
+        Parameters
+        ----------
+        signal_df : DataFrame (dates × assets)
+            Target portfolio weights.
+        phi_series : Series (dates,)
+            Rolling scalar φ estimates from rolling_signal_decay().
+            Dates without an estimate use the last known φ.
+        """
+        cols = signal_df.columns
+        dates = signal_df.index
+        positions = {}
+        w_prev = np.zeros(len(cols))
+
+        for date in dates:
+            if date in phi_series.index:
+                self.phi = np.atleast_1d(float(phi_series.loc[date]))
+                self._a = self._compute_a()
+                self._trading_frac = np.clip(self._a / self.lam, 0.0, 1.0)
+                self.aim_weights = self._compute_aim_weights()
+
+            target = signal_df.loc[date].values.astype(float)
+            target = np.nan_to_num(target, 0.0)
+            w_prev = self.step(target, w_prev)
+            positions[date] = w_prev.copy()
+
+        return pd.DataFrame(positions, index=cols).T
+
     def summary(self) -> dict:
         """Return key parameters for inspection / logging."""
         return {
@@ -267,6 +328,7 @@ class DynTrad:
 def run_dyntrad(
     raw_weights: pd.DataFrame,
     signal_decay: float | np.ndarray = 0.65,
+    rolling_phi: pd.Series | None = None,
     risk_aversion: float = 1.0,
     cost_multiplier: float = 2.0,
     discount_rate: float = 0.001,
@@ -280,8 +342,11 @@ def run_dyntrad(
     raw_weights : DataFrame (dates × assets)
         Target portfolio weights from the signal model.
     signal_decay : float or array
-        φ — signal persistence. 0.65 is the measured autocorrelation
-        of the DM-RET signal in XFUND.
+        φ — signal persistence. Used as the initial/static value.
+        0.65 is the measured autocorrelation of the DM-RET signal.
+    rolling_phi : Series (dates,) or None
+        If provided, overrides signal_decay with a time-varying φ at each
+        step. Compute with rolling_signal_decay(). When None, static φ is used.
     risk_aversion : float
         γ — higher = more aggressive trading toward aim.
     cost_multiplier : float
@@ -307,7 +372,11 @@ def run_dyntrad(
         gross_exposure=gross_exposure,
     )
 
-    adjusted = engine.run(raw_weights)
+    if rolling_phi is not None:
+        adjusted = engine.run_rolling(raw_weights, rolling_phi)
+    else:
+        adjusted = engine.run(raw_weights)
+
     return adjusted, engine.summary()
 
 

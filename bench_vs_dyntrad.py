@@ -21,7 +21,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 import BACKTEST
-from execution_layer import run_dyntrad, estimate_signal_decay
+from execution_layer import run_dyntrad, estimate_signal_decay, rolling_signal_decay
 
 # ── Simulation parameters ──────────────────────────────────────────────────────
 N_STOCKS   = 500
@@ -119,7 +119,7 @@ if __name__ == "__main__":
     signal_oos    = signal.loc[oos_dates[:-1]]   # last date has no forward return
     bench_w       = build_weights(signal_oos)
 
-    # ── DynTrad on top of bench signal ────────────────────────────────────────
+    # ── DynTrad (static φ) ────────────────────────────────────────────────────
     phi_est = estimate_signal_decay(bench_w).mean()
     bench_dt, dt_params = run_dyntrad(
         bench_w,
@@ -127,15 +127,31 @@ if __name__ == "__main__":
         cost_multiplier=2.0,
         gross_exposure=2.0,
     )
-    print(f"[DynTrad]  φ_estimated={phi_est:.3f}  δ={dt_params['trading_fraction_delta']:.3f}"
-          f"  aim_weight={dt_params['aim_weights'][0]:.3f}\n")
+    print(f"[DynTrad static]   φ={phi_est:.3f}  δ={dt_params['trading_fraction_delta']:.3f}"
+          f"  aim_weight={dt_params['aim_weights'][0]:.3f}")
+
+    # ── DynTrad (rolling φ, 24-month window) ─────────────────────────────────
+    phi_roll = rolling_signal_decay(bench_w, window=24)
+    bench_dt_roll, dt_roll_params = run_dyntrad(
+        bench_w,
+        signal_decay=phi_est,      # initial φ before first rolling estimate
+        rolling_phi=phi_roll,
+        cost_multiplier=2.0,
+        gross_exposure=2.0,
+    )
+    print(f"[DynTrad rolling]  φ range=[{phi_roll.min():.3f}, {phi_roll.max():.3f}]"
+          f"  φ mean={phi_roll.mean():.3f}\n")
 
     # Prices for PnL (OOS window, matching signal dates)
     px_oos   = px.loc[oos_dates]
     tc       = TC_BPS / 1e4
 
     results = {}
-    for label, w in [("Bench zMOM12 L/S", bench_w), ("Bench-DT L/S", bench_dt)]:
+    for label, w in [
+        ("Bench zMOM12 L/S",    bench_w),
+        ("Bench-DT static L/S", bench_dt),
+        ("Bench-DT rolling L/S",bench_dt_roll),
+    ]:
         sigs = [d for d in w.index if d in px_oos.index]
         w_bt = w.reindex(columns=px_oos.columns).fillna(0.0)
         res  = BACKTEST.backtest(
@@ -157,10 +173,20 @@ if __name__ == "__main__":
     print("=" * 70)
 
     # ── Turnover detail ───────────────────────────────────────────────────────
-    to_bench = bench_w.diff().abs().sum(axis=1).mean() * 12
-    to_dt    = bench_dt.diff().abs().sum(axis=1).mean() * 12
-    print(f"\nTurnover (ann):  Bench={to_bench:.0%}  Bench-DT={to_dt:.0%}"
-          f"  reduction={(1-to_dt/to_bench)*100:.0f}%")
+    to_bench    = bench_w.diff().abs().sum(axis=1).mean() * 12
+    to_dt       = bench_dt.diff().abs().sum(axis=1).mean() * 12
+    to_dt_roll  = bench_dt_roll.diff().abs().sum(axis=1).mean() * 12
+    print(f"\nTurnover (ann):")
+    print(f"  Bench={to_bench:.0%}")
+    print(f"  DT-static={to_dt:.0%}   reduction={(1-to_dt/to_bench)*100:.0f}%")
+    print(f"  DT-rolling={to_dt_roll:.0%}  reduction={(1-to_dt_roll/to_bench)*100:.0f}%")
+
+    # ── Rolling φ over time ───────────────────────────────────────────────────
+    print(f"\nRolling φ (24m window) — first/mid/last:")
+    n = len(phi_roll)
+    for i in [0, n // 2, n - 1]:
+        d = phi_roll.index[i]
+        print(f"  {d.date()}  φ={phi_roll.iloc[i]:.3f}")
 
     # ── Delta sensitivity ─────────────────────────────────────────────────────
     print("\nDelta sensitivity (cost_multiplier sweep):")
