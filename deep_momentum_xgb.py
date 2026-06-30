@@ -17,6 +17,7 @@ import warnings
 import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
+from execution_layer import run_dyntrad, estimate_signal_decay
 
 warnings.filterwarnings("ignore")
 
@@ -1269,7 +1270,7 @@ def compare_strategies(
     save_fig: str = "dm_comparison_tiingo.png",
 ) -> dict:
     """
-    Run Bench (zMOM12 L/S), DM-RET L/S plus SPY B&H.
+    Run Bench (zMOM12 L/S), DM-RET L/S, DM-DT L/S (+ DynTrad), SPY B&H.
     preloaded          : (prices_monthly, rets_monthly, size_monthly) from load_broad_universe_tiingo()
     min_dollar_vol_pct : relative liquidity filter (0 = off, 0.7 = keep top 30%).
     min_dollar_vol_abs : absolute monthly dollar-volume floor (default $1M).
@@ -1357,10 +1358,20 @@ def compare_strategies(
         )
 
     #   DM       DM-RET reclassification (Σ pₖμₖ), equal-weight decile L/S
-    dm     = dm_w["ret"]
+    #   DM-DT    DM + DynTrad execution layer (Gârleanu–Pedersen 2013)
+    dm = dm_w["ret"]
+
+    phi_est   = estimate_signal_decay(dm).mean()
+    dm_dt, dt_params = run_dyntrad(dm, signal_decay=phi_est)
+    print(
+        f"\n[DynTrad] φ={phi_est:.3f}  δ=a/λ={dt_params['trading_fraction_delta']:.3f}"
+        f"  aim_weight={dt_params['aim_weights'][0]:.3f}"
+    )
+
     for label, raw_w in [
         ("Bench zMOM12 L/S",  bench_w),   # raw momentum benchmark
-        ("DM L/S",            dm),        # DM-RET reclassification
+        ("DM L/S",            dm),        # DM-RET, no execution layer
+        ("DM-DT L/S",         dm_dt),     # DM-RET + DynTrad execution layer
     ]:
         oos_start = raw_w.index[0]
         if oos_start_ref is None:
