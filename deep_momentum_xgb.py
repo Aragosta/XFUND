@@ -17,15 +17,15 @@ import warnings
 import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
+from features import make_features, MOM_WINDOWS
 from execution_layer import run_dyntrad, estimate_signal_decay
 
 warnings.filterwarnings("ignore")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MOM_WINDOWS   = [1, 3, 6, 9, 12]   # momentum lookback months
 N_SEEDS       = 20                  # ensemble size (paper uses 50-100; 20 balances speed vs. stability)
 MIN_TRAIN_YRS = 10                  # minimum training history before first pred
-TOP_Q         = 0.05                # long / short tail size (paper: edge concentrates in outer 5%)
+TOP_Q         = 0.10                # long / short tail size
 
 # Paper: "default hyperparameters, except for early stopping"
 XGB_PARAMS = dict(
@@ -79,72 +79,8 @@ def load_data(csv_path=None):
     return rets, size
 
 
-# ── 2. Feature engineering ────────────────────────────────────────────────────
-def make_features(
-    rets: pd.DataFrame,
-    size: pd.DataFrame,
-    t: int,
-    ffd_scores: dict | None = None,
-) -> pd.DataFrame:
-    """
-    Build feature matrix at time index t.  Paper Table 1 + dynamics (+ FFD).
-
-    Paper features (20): 5 nMOM + 5 MMOM + 10 SIZE dummies (MOM-SZ-NOM spec).
-    Added momentum-dynamics features (6), each z-scored cross-sectionally with its
-    cross-sectional mean retained (same treatment as nMOM/MMOM, paper Sec. 3.2.3):
-        ACCEL  recent (t-6..t-2) minus older (t-12..t-7) cumulative return  → rising/fading momentum
-        VOL    trailing 11-month cross-sectional realized vol               → momentum-risk conditioning
-        POS    fraction of up months over t-12..t-2                         → frog-in-the-pan consistency
-    If ffd_scores is supplied, 10 more (5 zFFD + 5 MFFD) are appended → 36 total.
-    All computed with one vectorized op over the cross-section (no Python loops over stocks).
-    """
-    feats = {}
-
-    def _zc(s: pd.Series, name: str):
-        """Cross-sectional z-score + retain the cross-sectional mean (macro state)."""
-        mu, sigma = s.mean(), s.std()
-        feats[f"z{name}"] = (s - mu) / (sigma + 1e-10)
-        feats[f"M{name}"] = mu
-
-    # ── Raw cumulative-return momentum (paper Eq. 6–8) — ALWAYS ───────────────
-    for m in MOM_WINDOWS:
-        if m == 1:
-            mom = rets.iloc[t - 1]
-        else:
-            mom = (1 + rets.iloc[t - m : t - 1]).prod() - 1
-        mu    = mom.mean()
-        sigma = mom.std()
-        feats[f"zMOM{m}"] = (mom - mu) / (sigma + 1e-10)
-        feats[f"MMOM{m}"] = mu
-
-    # ── Momentum-dynamics features (all vectorized across stocks) — ALWAYS ────
-    win = rets.iloc[t - 12 : t - 1]                          # months t-12..t-2 (11 rows)
-    mom_recent = (1 + rets.iloc[t - 6  : t - 1]).prod() - 1  # t-6..t-2
-    mom_older  = (1 + rets.iloc[t - 12 : t - 6]).prod() - 1  # t-12..t-7
-    _zc(mom_recent - mom_older, "ACCEL")                     # momentum acceleration
-    _zc(win.std(),              "VOL")                       # trailing realized vol
-    _zc((win > 0).mean(),       "POS")                       # fraction of up months
-
-    # ── FFD momentum (López de Prado, AFML Ch. 5) — ADDED when scores supplied ─
-    # Stationary, memory-preserving trend.  No look-ahead: optimal d is frozen on
-    # the pre-OOS training window and the FIR filter is causal (see
-    # _ffd_from_training_window).  Each window z-scored cross-sectionally + mean kept.
-    if ffd_scores is not None:
-        for m in sorted(ffd_scores.keys()):     # decoupled from MOM_WINDOWS (e.g. {1,3,12})
-            row   = ffd_scores[m].iloc[t - 1].reindex(rets.columns)
-            mu    = row.mean()
-            sigma = row.std()
-            feats[f"zFFD{m}"] = (row - mu) / (sigma + 1e-10)
-            feats[f"MFFD{m}"] = mu
-
-    # SIZE: 10 binary dummies D_s, s=1..10 (paper Sec. 3.3.1)
-    cap         = size.iloc[t - 1].rank(pct=True, na_option="keep").fillna(0.5)
-    size_decile = ((cap * 9.999).astype(int) + 1)  # 1–10
-    for s in range(1, 11):
-        feats[f"SIZE_{s}"] = (size_decile == s).astype(float)
-
-    return pd.DataFrame(feats, index=rets.columns)
-
+# ── 2. Feature engineering — imported from features.py ───────────────────────
+# make_features(rets, size, t, ffd_scores=None) → DataFrame(N_stocks × features)
 
 # ── 3. Label construction ─────────────────────────────────────────────────────
 def _decile_labels(fwd: pd.Series) -> pd.Series:
@@ -1118,7 +1054,7 @@ def _generate_all_dm_weights(
     portfolio: str = "ls",
     q: float = TOP_Q,
     min_train_months: int = MIN_TRAIN_YRS * 12,
-    max_train_months: int | None = 60,
+    max_train_months: int | None = 120,
     n_seeds: int = N_SEEDS,
     use_ffd: bool = True,
     ffd_scores: dict | None = None,
@@ -1262,7 +1198,7 @@ def compare_strategies(
     *,
     n_seeds: int = N_SEEDS,
     min_train_months: int = MIN_TRAIN_YRS * 12,
-    max_train_months: int | None = 60,
+    max_train_months: int | None = 120,
     q: float = TOP_Q,
     transaction_cost: float = 0.001,
     min_dollar_vol_pct: float = 0.0,
@@ -1434,7 +1370,7 @@ if __name__ == "__main__":
         ckpt_exists = os.path.exists("tiingo_download_checkpoint.parquet")
         print(f"\n[tiingo] Loading broad universe (start={start_yr}, seeds={seeds}) …")
         data = load_broad_universe_tiingo(start_date=start_yr, skip_download=ckpt_exists)
-        compare_strategies(data, n_seeds=seeds, max_train_months=60)  # rolling 60m window
+        compare_strategies(data, n_seeds=seeds)
 
     elif args and os.path.isfile(args[0]) and args[0].endswith(".csv"):
         # CSV archive pipeline: python deep_momentum_xgb.py all_stocks_5yr.csv srp ls
