@@ -23,9 +23,9 @@ from execution_layer import run_dyntrad, estimate_signal_decay
 warnings.filterwarnings("ignore")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-N_SEEDS       = 20                  # ensemble size (paper uses 50-100; 20 balances speed vs. stability)
+N_SEEDS       = 3                   # ensemble size (3≈10 empirically; 3 for fast iteration)
 MIN_TRAIN_YRS = 10                  # minimum training history before first pred
-TOP_Q         = 0.10                # long / short tail size
+TOP_Q         = 0.05                # long / short tail size
 
 # Paper: "default hyperparameters, except for early stopping"
 XGB_PARAMS = dict(
@@ -1178,6 +1178,178 @@ def _generate_all_dm_weights(
     return out
 
 
+def _ewma_vol(rets: pd.DataFrame, span: int = 12, min_periods: int = 6) -> pd.DataFrame:
+    """
+    Causal per-stock EWMA volatility of monthly returns.  The value in row t uses
+    only returns through t (``ewm`` is strictly backward-looking), so reading it at
+    the signal date t-1 introduces no look-ahead.  Used to risk-normalise the
+    prediction target (Lim-Zohren-Roberts 2019): label = decile of r / σ_ewma.
+    """
+    return rets.ewm(span=span, min_periods=min_periods).std()
+
+
+def _generate_dm_variant_weights(
+    rets: pd.DataFrame,
+    size: pd.DataFrame,
+    prices_monthly: pd.DataFrame,
+    *,
+    portfolio: str = "ls",
+    q: float = TOP_Q,
+    min_train_months: int = MIN_TRAIN_YRS * 12,
+    max_train_months: int | None = 120,
+    n_seeds: int = N_SEEDS,
+    use_ffd: bool = True,
+    ffd_scores: dict | None = None,
+    eligible: pd.DataFrame | None = None,
+    shortable: pd.DataFrame | None = None,
+    horizons: tuple[int, ...] = (1,),
+    vol_normalize: bool = False,
+    vol_span: int = 12,
+    tag: str = "variant",
+) -> pd.DataFrame:
+    """
+    Generalised DM-RET weight generator for two research extensions.  With the
+    defaults (``horizons=(1,)``, ``vol_normalize=False``) it reproduces the standard
+    single-step DM-RET of ``_generate_all_dm_weights``; everything else (rolling
+    window, time-blocked early-stopping split, FFD features, eligibility /
+    borrowability masks, raw-return PnL) is held identical so the comparison
+    isolates the target/horizon change.
+
+      * Multi-horizon (``horizons=(1, 2)``): trains ONE decile classifier per
+        forward horizon h — target = return of month t+h-1, features frozen at the
+        signal date t-1 — and ranks on the SUM of the per-horizon expected returns.
+        Tests whether also forecasting t+2 sharpens the t+1 trade.  No look-ahead:
+        the t+2 label is only a *training* target; at prediction time the features
+        still use data ≤ t-1 and the book is still held for one month (rets.iloc[t]).
+
+      * Vol-normalised target (``vol_normalize=True``): the target is the
+        EWMA-vol-scaled return r / σ_ewma (σ causal, known at t-1), so the model
+        ranks stocks by predicted *risk-adjusted* return.  μ_k and the RET score use
+        the same scaled target; PnL is still booked on raw returns.
+    """
+    T          = len(rets)
+    first_feat = max(MOM_WINDOWS) + 1
+    first_pred = min_train_months + first_feat
+    h_max      = max(horizons)
+
+    if first_pred >= T - h_max:
+        raise ValueError(f"Need ≥ {first_pred + h_max + 1} monthly obs; got {T}.")
+
+    if use_ffd and ffd_scores is None:
+        print(f"  [{tag} FFD] initial optimal-d search on first training window …")
+        ffd_scores = _ffd_from_training_window(prices_monthly, first_pred)
+        for m in list(ffd_scores.keys()):
+            ffd_scores[m] = ffd_scores[m].reindex(rets.index)
+
+    vol = _ewma_vol(rets, span=vol_span) if vol_normalize else None
+
+    def _target(t: int, h: int) -> pd.Series:
+        """(Optionally EWMA-vol-scaled) forward return of month t+h-1; scaling causal (σ at t-1)."""
+        r = rets.iloc[t + h - 1]
+        if vol_normalize:
+            r = r / vol.iloc[t - 1].replace(0.0, np.nan)
+        return r
+
+    # Pool: t → (features, {h: decile labels of the horizon-h target})
+    pool: dict = {}
+    for t in range(first_feat, T - h_max):
+        F   = make_features(rets, size, t, ffd_scores=ffd_scores).dropna()
+        idx = F.index
+        if eligible is not None:
+            e   = eligible.iloc[t - 1]
+            idx = idx.intersection(e.index[e.values])
+        if len(idx) < 20:
+            continue
+        labels, ok = {}, True
+        for h in horizons:
+            tgt = _target(t, h).reindex(idx).dropna()
+            if len(tgt) < 20:
+                ok = False
+                break
+            labels[h] = _decile_labels(tgt)        # deciles within the eligible cross-section
+        if ok:
+            pool[t] = (F.loc[idx], labels)
+
+    rows: dict        = {}
+    model_store: dict = {}
+    pred_years        = sorted({rets.index[t].year for t in range(first_pred, T - h_max)})
+
+    for year in pred_years:
+        months = [t for t in range(first_pred, T - h_max) if rets.index[t].year == year]
+        if not months:
+            continue
+        t_cut  = months[0]
+        all_ts = sorted([t for t in pool if t < t_cut])
+        if max_train_months and len(all_ts) > max_train_months:
+            all_ts = all_ts[-max_train_months:]       # rolling window
+        n_val  = max(6, int(len(all_ts) * 0.2))
+
+        if len(all_ts) >= 18:
+            n_tr    = len(all_ts) - n_val
+            tr_ts_s = all_ts[:n_tr]
+            va_ts_s = all_ts[n_tr:]                    # time-blocked early-stopping split
+            ens: dict = {}                             # h → (models, mu_k)
+            for h in horizons:
+                # μ_k: mean (scaled) target per decile, for the RET reclassification
+                tgt_all = pd.concat([_target(t, h).reindex(pool[t][1][h].index) for t in all_ts])
+                lab_all = pd.concat([pool[t][1][h] for t in all_ts])
+                grp     = pd.DataFrame({"l": lab_all.values, "r": tgt_all.values}).groupby("l")["r"]
+                mu_k    = np.array([grp.get_group(k).mean() if k in grp.groups else 0.0 for k in range(10)])
+
+                X_tr = pd.concat([pool[t][0].reindex(pool[t][1][h].index) for t in tr_ts_s])
+                y_tr = pd.concat([pool[t][1][h] for t in tr_ts_s])
+                X_va = pd.concat([pool[t][0].reindex(pool[t][1][h].index) for t in va_ts_s])
+                y_va = pd.concat([pool[t][1][h] for t in va_ts_s])
+                models = []
+                for seed in range(n_seeds):
+                    m = XGBClassifier(**XGB_PARAMS, random_state=seed).fit(
+                        X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False
+                    )
+                    models.append(m)
+                ens[h] = (models, mu_k)
+            print(f"  [{tag} {year}] pool={len(all_ts)}  n_val={n_val}  "
+                  f"horizons={list(horizons)}  seeds={n_seeds}")
+            model_store[year] = ens
+
+        elif model_store:
+            model_store[year] = list(model_store.values())[-1]
+        else:
+            continue
+
+        ens = model_store[year]
+
+        for t in months:
+            if t not in pool:
+                continue
+            F, _ = pool[t]
+            if len(F) < 20:
+                continue
+            signal_date = rets.index[t - 1]
+            sc = np.zeros(len(F))
+            for h in horizons:                         # sum of per-horizon expected returns
+                mdls, mu_k = ens[h]
+                probs = np.mean([m.predict_proba(F) for m in mdls], axis=0)
+                sc   += score_ret(probs, mu_k)
+            s_ser = pd.Series(sc, index=F.index)
+            n     = max(1, int(len(s_ser) * q))
+            w     = pd.Series(0.0, index=F.index)
+            w[s_ser.nlargest(n).index]  = +1.0 / n
+            if portfolio == "ls":
+                s_short = s_ser
+                if shortable is not None:               # borrowability: short only HTB-eligible
+                    sh = shortable.iloc[t - 1]
+                    s_short = s_ser.loc[s_ser.index.intersection(sh.index[sh.values])]
+                w[s_short.nsmallest(n).index] = -1.0 / n
+            rows[signal_date] = w
+
+    if not rows:
+        raise ValueError(f"No weights generated for {tag}.")
+    df = pd.DataFrame(rows).T.fillna(0.0).sort_index()
+    df.index.name = "date"
+    print(f"[{tag}] {len(df)} signal dates  ({df.index[0].date()} – {df.index[-1].date()})")
+    return df
+
+
 def _weights_to_daily(weights: pd.DataFrame, prices_daily: pd.DataFrame) -> tuple:
     """Map monthly weight index to nearest prior trading day.  Returns (mapped_df, signal_date_list)."""
     daily_idx    = prices_daily.index
@@ -1255,13 +1427,32 @@ def compare_strategies(
 
     # ── 3. DM weights (momentum + dynamics + FFD features) ───────────────────
     # use_ffd=True: optimal d frozen on the initial training window, causal filter
-    # → FFD features added with no OOS look-ahead.
+    # → FFD features added with no OOS look-ahead.  The optimal-d search is run ONCE
+    # here and shared across all DM variants below (it is data-only, identical for
+    # every variant) so we don't pay for it three times.
+    first_feat   = max(MOM_WINDOWS) + 1
+    first_pred   = min_train_months + first_feat
+    print("\n── Shared FFD optimal-d search (initial training window) ────────────")
+    shared_ffd = _ffd_from_training_window(prices_monthly, first_pred)
+    for m in list(shared_ffd.keys()):
+        shared_ffd[m] = shared_ffd[m].reindex(rets_monthly.index)
+
     print("\n── Deep Momentum L/S (+ FFD) ────────────────────────────────────────")
     dm_w = _generate_all_dm_weights(
         rets_monthly, size_monthly, prices_monthly,
         min_train_months=min_train_months, max_train_months=max_train_months,
-        q=q, n_seeds=n_seeds, use_ffd=True,
+        q=q, n_seeds=n_seeds, use_ffd=True, ffd_scores=shared_ffd,
         portfolio="ls", pool=None, eligible=eligible, shortable=shortable,
+    )
+
+    # ── 3b. Research variant — multi-horizon (forecast t+1 AND t+2) ──────────
+    print("\n── DM Multi-Horizon L/S  (forecast t+1 & t+2) ───────────────────────")
+    dm_mh = _generate_dm_variant_weights(
+        rets_monthly, size_monthly, prices_monthly,
+        min_train_months=min_train_months, max_train_months=max_train_months,
+        q=q, n_seeds=n_seeds, use_ffd=True, ffd_scores=shared_ffd,
+        portfolio="ls", eligible=eligible, shortable=shortable,
+        horizons=(1, 2), vol_normalize=False, tag="DM-MH",
     )
 
     # ── 4. SPY benchmark (Tiingo — same source as the universe) ──────────────
@@ -1306,7 +1497,8 @@ def compare_strategies(
 
     for label, raw_w in [
         ("Bench zMOM12 L/S",  bench_w),   # raw momentum benchmark
-        ("DM L/S",            dm),        # DM-RET, no execution layer
+        ("DM L/S",            dm),        # DM-RET standard (120m train, q, single-step)
+        ("DM-MH L/S",         dm_mh),     # multi-output: forecast t+1 & t+2
         ("DM-DT L/S",         dm_dt),     # DM-RET + DynTrad execution layer
     ]:
         oos_start = raw_w.index[0]
