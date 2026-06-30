@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore")
 # ── Config ────────────────────────────────────────────────────────────────────
 N_SEEDS       = 20                  # ensemble size (paper uses 50-100; 20 balances speed vs. stability)
 MIN_TRAIN_YRS = 10                  # minimum training history before first pred
-TOP_Q         = 0.05                # long / short tail size (paper: edge concentrates in outer 5%)
+TOP_Q         = 0.10                # long / short tail size
 
 # Paper: "default hyperparameters, except for early stopping"
 XGB_PARAMS = dict(
@@ -1053,7 +1053,7 @@ def _generate_all_dm_weights(
     portfolio: str = "ls",
     q: float = TOP_Q,
     min_train_months: int = MIN_TRAIN_YRS * 12,
-    max_train_months: int | None = 60,
+    max_train_months: int | None = 120,
     n_seeds: int = N_SEEDS,
     use_ffd: bool = True,
     ffd_scores: dict | None = None,
@@ -1227,7 +1227,7 @@ def compare_strategies(
     *,
     n_seeds: int = N_SEEDS,
     min_train_months: int = MIN_TRAIN_YRS * 12,
-    max_train_months: int | None = 60,
+    max_train_months: int | None = 120,
     q: float = TOP_Q,
     transaction_cost: float = 0.001,
     min_dollar_vol_pct: float = 0.0,
@@ -1392,7 +1392,7 @@ if __name__ == "__main__":
         ckpt_exists = os.path.exists("tiingo_download_checkpoint.parquet")
         print(f"\n[tiingo] Loading broad universe (start={start_yr}, seeds={seeds}) …")
         data = load_broad_universe_tiingo(start_date=start_yr, skip_download=ckpt_exists)
-        compare_strategies(data, n_seeds=seeds, max_train_months=60)  # rolling 60m window
+        compare_strategies(data, n_seeds=seeds)
 
     elif args and os.path.isfile(args[0]) and args[0].endswith(".csv"):
         # CSV archive pipeline: python deep_momentum_xgb.py all_stocks_5yr.csv srp ls

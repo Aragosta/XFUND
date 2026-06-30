@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MOM_WINDOWS = [1, 3, 6, 9, 12]   # cumulative-return lookback windows (months)
+MOM_WINDOWS = [1, 3, 6, 9, 12, 18]  # cumulative-return lookback windows (months)
 FFD_WINDOWS = [1, 3, 12]         # FFD score windows (match build_ffd_scores_v2 default)
 
 # Feature name lists — order matches make_features() insertion order
