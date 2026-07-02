@@ -1061,6 +1061,7 @@ def _generate_all_dm_weights(
     pool: dict | None = None,
     eligible: pd.DataFrame | None = None,
     shortable: pd.DataFrame | None = None,
+    eligible_trade: pd.DataFrame | None = None,
 ) -> dict:
     """
     Train XGBoost (rolling window), then score DPR / RET / SRP.
@@ -1155,8 +1156,17 @@ def _generate_all_dm_weights(
 
             sc    = score_ret(probs, mu_k)          # DM-RET reclassification (Σ pₖμₖ)
             s_ser = pd.Series(sc, index=F.index)
+            # Decouple training from trading universe: the model may be trained on the
+            # broad (eligible) pool, but the *traded* book is restricted to eligible_trade
+            # (e.g. the liquid names).  Scores come from the broad-trained model; selection
+            # and book size (n = q · liquid count) use only the tradeable cross-section.
+            if eligible_trade is not None:
+                et    = eligible_trade.iloc[t - 1]
+                s_ser = s_ser.loc[s_ser.index.intersection(et.index[et.values])]
+                if len(s_ser) < 20:
+                    continue
             n     = max(1, int(len(s_ser) * q))
-            w     = pd.Series(0.0, index=F.index)
+            w     = pd.Series(0.0, index=s_ser.index)
             w[s_ser.nlargest(n).index]  = +1.0 / n
             if portfolio == "ls":
                 s_short = s_ser

@@ -50,9 +50,9 @@ spx = {}
 for tk in SECT:
     try:
         s = d.fetch_tiingo_monthly(tk, "1999-01-01", dates[-1].strftime("%Y-%m-%d")).iloc[:, 0]
-        sm = s.resample("ME").last().pct_change()
-        sm.index = sm.index.to_period("M")                 # align by period, not exact timestamp
-        spx[tk] = sm
+        sr = s.resample("ME").last().pct_change()          # NB: not `sm` — that's statsmodels
+        sr.index = sr.index.to_period("M")                 # align by period, not exact timestamp
+        spx[tk] = sr
     except Exception as e:
         print(f"  [warn] {tk}: {e}")
 sect = pd.DataFrame(spx).reindex(ym); sect.index = dates    # period-align then assign our dates
@@ -115,17 +115,18 @@ for nm, lab in [("total", "Total 12-1"), ("common", "Common (FF5+ind)"),
     a, sh, so, dd = perf(pd.Series(res[nm]["returns"]))
     print(f"{lab:20}{a:>8.1%}{sh:>8.2f}{so:>8.2f}{dd:>9.1%}")
 
-# ── ALPHA CERTIFICATION: regress common-momentum L/S on FF5+MOM+STR (HAC) ──
-print("\n=== ALPHA REGRESSION — Common-ex-market momentum on FF5+MOM+STR (Newey-West) ===")
-y = pd.Series(res["common_xmkt"]["returns"]).dropna()
-Xf = FF.loc[y.index, ["MktRF", "SMB", "HML", "RMW", "CMA", "MOM", "STR"]]
-keep = Xf.dropna().index; y = y.loc[keep]; Xf = Xf.loc[keep]
-m = sm.OLS(y.values, sm.add_constant(Xf.values)).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
+# ── ALPHA CERTIFICATION: regress each sleeve on FF5+MOM+STR (HAC) ──
 names = ["alpha", "MktRF", "SMB", "HML", "RMW", "CMA", "MOM", "STR"]
-print(f"{'term':8}{'coef':>10}{'t-stat':>9}")
-for nm, c, tval in zip(names, m.params, m.tvalues):
-    star = "***" if abs(tval) > 2.6 else ("**" if abs(tval) > 1.96 else "")
-    sc = c * 12 if nm == "alpha" else c
-    print(f"{nm:8}{sc:>10.4f}{tval:>9.2f} {star}" + ("   (annualized alpha)" if nm == "alpha" else ""))
-print(f"\nR² = {m.rsquared:.3f}   n = {len(y)} months")
+for sleeve, lab in [("common_xmkt", "Common ex-market"), ("specific", "Stock-specific")]:
+    print(f"\n=== ALPHA REGRESSION — {lab} momentum on FF5+MOM+STR (Newey-West) ===")
+    y = pd.Series(res[sleeve]["returns"]).dropna()
+    Xf = FF.loc[y.index, ["MktRF", "SMB", "HML", "RMW", "CMA", "MOM", "STR"]]
+    keep = Xf.dropna().index; y = y.loc[keep]; Xf = Xf.loc[keep]
+    m = sm.OLS(y.values, sm.add_constant(Xf.values)).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
+    print(f"{'term':8}{'coef':>10}{'t-stat':>9}")
+    for nm, c, tval in zip(names, m.params, m.tvalues):
+        star = "***" if abs(tval) > 2.6 else ("**" if abs(tval) > 1.96 else "")
+        sc = c * 12 if nm == "alpha" else c
+        print(f"{nm:8}{sc:>10.4f}{tval:>9.2f} {star}" + ("   (annualized alpha)" if nm == "alpha" else ""))
+    print(f"R² = {m.rsquared:.3f}   n = {len(y)} months")
 print("\n[done]", flush=True)
