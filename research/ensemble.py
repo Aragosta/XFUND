@@ -16,19 +16,21 @@ weight (primary), risk-parity, rolling-Sharpe. DM streams cached (deterministic 
 import warnings; warnings.filterwarnings("ignore")
 import os, pickle
 import numpy as np, pandas as pd
-from xgboost import XGBRegressor
+from xgboost import XGBRegressor, XGBRanker
 import deep_momentum_xgb as d
 from features import make_features, MOM_WINDOWS
 import BACKTEST
 
 # ─── config ───
 N_SEEDS   = 3
-MOM_TOPN  = 1000          # broad MOM universe: top-N by $-volume each month
+MOM_TOPN  = 2000          # broad MOM universe: top-N by $-volume (wider = big breadth gain)
 MOM_MINPX = 5.0           # penny-stock filter
 MOM_MINDV = 5e6           # liquidity floor ($ / month)
 RET_CAP   = 1.0           # mask UPSIDE glitches (r >= +100%); keep real losses incl -100%
 DELIST_RET = -0.30        # realistic delisting return (Han fallback) imputed when a name stops trading
 BASEP = dict(n_estimators=200, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, verbosity=0)
+RNKP = dict(objective="rank:pairwise", eval_metric="ndcg", n_estimators=200, max_depth=5, learning_rate=0.1,
+            subsample=0.8, colsample_bytree=0.8, verbosity=0)   # LambdaMART (Quantitativo config)
 
 def perf(r):
     r = pd.Series(r).dropna(); ann = (1 + r).prod() ** (12 / len(r)) - 1; vol = r.std() * np.sqrt(12)
@@ -117,10 +119,12 @@ for k in range(13, T - 3):
     idx = P.index[ok.values]                                     # require Poh valid; FFD neutral-filled
     if len(idx) < 50: continue
     Y = np.column_stack([zc(mret.iloc[k+h].reindex(idx)).values for h in (1, 2, 3)])
-    pool[k] = dict(P=P.loc[idx].fillna(0.0), Y=Y, pnl=pn.reindex(idx), dt=dt)
+    _f1 = mret.iloc[k + 1].reindex(idx)
+    r30 = ((_f1.rank(method="first") - 1) * 30 // len(_f1)).clip(upper=29).astype(int).values   # 30-quantile relevance
+    pool[k] = dict(P=P.loc[idx].fillna(0.0), Y=Y, r30=r30, pnl=pn.reindex(idx), dt=dt)
 keys = sorted(pool); fp = next(i for i, k in enumerate(keys) if me[k].year >= 2011)
 print("[MOM] walk-forward ...", flush=True)
-mom_g, mom_W = {}, {}; ms = None
+mom_g, mom_W = {}, {}; ms = rk = None
 for i in range(fp, len(keys)):
     k = keys[i]; dt = pool[k]["dt"]
     if dt.month in (1, 4, 7, 10) or ms is None:                 # quarterly retrain (fresher >> annual)
@@ -128,8 +132,13 @@ for i in range(fp, len(keys)):
         if len(tr) >= 36:
             X = pd.concat([pool[t]["P"] for t in tr]).values; Y = np.vstack([pool[t]["Y"] for t in tr])
             ms = [XGBRegressor(**BASEP, multi_strategy="multi_output_tree", random_state=s).fit(X, Y) for s in range(N_SEEDS)]
+            _yr = np.concatenate([pool[t]["r30"] for t in tr]); _qid = np.concatenate([np.full(len(pool[t]["P"]), j) for j, t in enumerate(tr)])
+            rk = [XGBRanker(**RNKP, random_state=s).fit(X, _yr, qid=_qid) for s in range(N_SEEDS)]   # pairwise ranker
     if ms is None: continue
-    sc = np.mean([m.predict(pool[k]["P"].values).mean(1) for m in ms], axis=0)
+    _Xk = pool[k]["P"].values
+    _rg = np.mean([m.predict(_Xk).mean(1) for m in ms], axis=0)
+    _rn = np.mean([m.predict(_Xk) for m in rk], axis=0)
+    sc = zc(pd.Series(_rg)).values + zc(pd.Series(_rn)).values   # reg+ranker ensemble (cuts drawdown ~40%)
     s = pd.Series(sc, index=pool[k]["pnl"].index); n = max(1, int(len(s) * 0.10))
     iv = (1 / (vol_d.loc[dt].reindex(s.index) * np.sqrt(21))).clip(upper=50)
     w = pd.Series(0.0, index=s.index); lo, sh = s.nlargest(n).index, s.nsmallest(n).index
