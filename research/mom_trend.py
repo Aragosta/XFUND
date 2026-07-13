@@ -4,7 +4,7 @@
 XGBoost vector-leaf `multi_strategy="multi_output_tree"` (XGBRegressor) on the Gaussian-rank of forward returns
 at HORIZONS [t+4, t+5, t+6]. FEATURES = ret/nret{3,6,12}, Baz MACD (y1/y2/y3 + composite), FFD, amihud, dvtrend,
 abnvol, residual-momentum. Full broad universe, seeds=5, decile L/S dollar-neutral, net via BACKTEST.py.
-Beta-neutralize the output book with BETANEUT.py before combining. Saves the decile book -> /tmp/mom_weights.pkl."""
+Beta-neutralize the output book with BETANEUT.py before combining. Saves the decile book -> /tmp/mom_trend_weights.pkl."""
 import warnings; warnings.filterwarnings("ignore")
 import pickle
 import numpy as np, pandas as pd
@@ -60,6 +60,15 @@ PF = list(pf.keys())
 
 print("[pool] ...", flush=True)
 HMAX = 6
+# TREND-SCAN target: forward Wd-month log-price trend t-stat. Same forward reach as HZ -> MOM's existing embargo
+# (HMAX) applies unchanged -> NO look-ahead. Swaps the grank(return) target for grank(trend t-stat).
+def _trendscan(Wd):
+    lp=np.log(m_px); xs=np.arange(Wd); xm=xs.mean(); sxx=((xs-xm)**2).sum(); Tt=pd.DataFrame(np.nan,index=me,columns=m_px.columns)
+    for i in range(len(me)-Wd):
+        y=lp.iloc[i+1:i+1+Wd].values; yb=np.nanmean(y,0); sl=np.nansum((xs[:,None]-xm)*(y-yb),0)/sxx
+        rr=y-(yb+np.outer(xs-xm,sl)); se=np.sqrt(np.nansum(rr**2,0)/(Wd-2)/sxx); Tt.iloc[i]=sl/(se+1e-9)
+    return Tt
+TS={h:_trendscan(h) for h in HZ}
 pool = {}
 for k in range(BW + 13, T - HMAX):
     dt = me[k]; el = elig.loc[dt].fillna(False); idx0 = el.index[el.values]
@@ -69,7 +78,7 @@ for k in range(BW + 13, T - HMAX):
     idx = P.index[ok.values]
     if len(idx) < 50: continue
     Prank = np.column_stack([grank(P.loc[idx].fillna(0.0)[c].values) for c in PF])
-    pool[k] = dict(Prank=Prank.astype(np.float32), idx=idx, Yg={h: grank(mret.iloc[k + h].reindex(idx).values) for h in HZ},
+    pool[k] = dict(Prank=Prank.astype(np.float32), idx=idx, Yg={h: grank(TS[h].iloc[k].reindex(idx).values) for h in HZ},
                    pnl=mret.iloc[k+1].reindex(idx), dt=dt)
 keys = sorted(pool); fp = next(i for i, k in enumerate(keys) if me[k].year >= 2011)
 print(f"[pool] {len(keys)} months, avg {np.mean([len(pool[k]['idx']) for k in keys if me[k].year>=2011]):.0f}", flush=True)
@@ -114,6 +123,6 @@ for tag, H, cg in [("1", 1, False), ("3", 3, True)]:
     lbl = "H=1       " if tag == "1" else "H=3 constG"
     print(f"[MOM] {lbl} net SR {n['sharpe']:.2f}  ann {n['ann_return']:.1%}  maxDD {n['max_drawdown']:.1%}"
           f"  turn {n['ann_turnover']:.1f}", flush=True)
-pickle.dump(out, open("/tmp/mom_champ.pkl", "wb"))
-pickle.dump(Wsave, open("/tmp/mom_weights.pkl", "wb"))                      # dates x tickers, for attribution
-print("[done] saved /tmp/mom_champ.pkl", flush=True)
+pickle.dump(out, open("/tmp/mom_trend_champ.pkl", "wb"))
+pickle.dump(Wsave, open("/tmp/mom_trend_weights.pkl", "wb"))                      # dates x tickers, for attribution
+print("[done] saved /tmp/mom_trend_champ.pkl", flush=True)

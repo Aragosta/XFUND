@@ -84,6 +84,33 @@ def rolling_signal_decay(
     return pd.Series(phi_vals)
 
 
+def estimate_book_persistence(weights: pd.DataFrame) -> float:
+    """(a) Book-level signal decay φ: the mean cross-sectional correlation between
+    consecutive-period target weight vectors — how persistent the target portfolio is
+    (the ACF1 of the book itself). φ→1 = very stable book, φ→0 = churns every period.
+    NB: in single-signal "weights" mode the aim-weight cancels after gross-normalization,
+    so φ does not move δ — it is estimated for correctness/reporting, not to set the rate."""
+    W = weights.fillna(0.0); cors = []; prev = None
+    for _, row in W.iterrows():
+        v = row.values
+        if prev is not None and np.std(v) > 0 and np.std(prev) > 0:
+            c = np.corrcoef(v, prev)[0, 1]
+            if np.isfinite(c): cors.append(c)
+        prev = v
+    return float(np.clip(np.nanmean(cors), 0.01, 0.99)) if cors else 0.5
+
+
+def calibrate_lambda(book_returns: pd.Series, avg_cost_oneway: float, risk_aversion: float = 1.0) -> float:
+    """(b) Derive GP's λ (Λ=λΣ) from OUR measured cost & risk instead of a paper default.
+    Calibrate the quadratic cost curvature so a ROUND-TRIP trade's cost matches the measured
+    proportional cost relative to the book's per-period variance:
+        λ = round_trip_cost / (γ · σ²_book) = 2·avg_cost_oneway / (γ · Var(book_returns)).
+    Higher cost or lower book risk → larger λ → slower trading (smaller δ)."""
+    sigma2 = float(np.nanvar(pd.Series(book_returns).dropna().values, ddof=1))
+    if sigma2 <= 0: return 2.0
+    return float(2.0 * avg_cost_oneway / (max(risk_aversion, 1e-9) * sigma2))
+
+
 def estimate_cost_matrix(
     dollar_volume: pd.DataFrame,
     base_cost_bps: float = 10.0,
@@ -195,6 +222,18 @@ class DynTrad:
     def effective_delta(self) -> float:
         """Alias for trading_fraction (backwards compatibility)."""
         return self._trading_frac
+
+    @classmethod
+    def from_book(cls, weights: pd.DataFrame, book_returns: pd.Series, avg_cost_oneway: float,
+                  risk_aversion: float = 1.0, discount_rate: float = 0.001, gross_exposure: float = 2.0):
+        """Build a DynTrad CALIBRATED to this book (not paper defaults):
+          (a) φ = estimate_book_persistence(weights)   — the book's own ACF1
+          (b) λ = calibrate_lambda(book_returns, avg_cost_oneway, γ)  — from measured cost/vol
+        The trading fraction δ then follows from the GP closed form. Exposes .phi/.lam/.trading_fraction."""
+        phi = estimate_book_persistence(weights)
+        lam = calibrate_lambda(book_returns, avg_cost_oneway, risk_aversion)
+        return cls(signal_decay=np.array([phi]), risk_aversion=risk_aversion, cost_multiplier=lam,
+                   discount_rate=discount_rate, input_type="weights", gross_exposure=gross_exposure)
 
     def aim(self, inputs: np.ndarray) -> np.ndarray:
         """

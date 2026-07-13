@@ -12,26 +12,30 @@ import warnings; warnings.filterwarnings("ignore")
 import os, pickle
 import numpy as np, pandas as pd
 from xgboost import XGBClassifier
-import deep_momentum_xgb as d
-from deep_momentum_xgb import make_features
 import BACKTEST
+from DATAHUB import DataHub
+from UNIVERSE import eligibility, ffd_scores
+from features import make_features, MOM_WINDOWS
 
-SEEDS = int(os.environ.get("SEEDS", 5)); TOP_Q = d.TOP_Q                    # champion = seeds=5
+SEEDS = int(os.environ.get("SEEDS", 5)); TOP_Q, MIN_TRAIN_YRS = 0.05, 10    # champion = seeds=5
 MAXTRAIN = int(os.environ.get("MAXTRAIN", 120)); DEC = 0.10                 # decile cutoffs for top/bottom labels
 XGB = dict(n_estimators=300, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
            tree_method="hist", multi_strategy="multi_output_tree", objective="binary:logistic", verbosity=0)
 
-print("[MH-DM] load broad universe ...", flush=True)
-pm, rm, sm = d.load_broad_universe_tiingo(skip_download=True, verbose=False)
-elig, short = d.compute_eligibility(pm, sm, min_dollar_vol_pct=0.30, min_dollar_vol_abs=1e6)
-pnl = d._build_pnl_prices(pm); tcd = BACKTEST.tiered_transaction_costs(sm); bfd = BACKTEST.tiered_borrow_fees(sm)
-me = rm.index; T = len(me); first_feat = max(d.MOM_WINDOWS) + 1
+print("[MH-DM] load from DataHub ...", flush=True)
+hub = DataHub(start="2000-01-01", min_days=0)
+pm = hub.delisted_prices("monthly")                                        # delisting-injected (global data eng)
+rm = hub.clean_returns("monthly")                                          # 1/99-winsorized returns (global)
+sm = hub.dollar_size("monthly")                                            # close × month-end volume
+elig, short = eligibility(pm, sm, min_dollar_vol_pct=0.30, min_dollar_vol_abs=1e6)
+pnl = hub.pnl("monthly"); tcd = BACKTEST.tiered_transaction_costs(sm); bfd = BACKTEST.tiered_borrow_fees(sm)
+me = rm.index; T = len(me); first_feat = max(MOM_WINDOWS) + 1
 
 ADDFFD = int(os.environ.get("ADDFFD", 0))                                   # 1 = add FFD (frac-diff) features to make_features
 FFD = None
 if ADDFFD:
     print("[MH-DM] computing FFD scores ...", flush=True)
-    FFD = d._ffd_from_training_window(pm, d.MIN_TRAIN_YRS*12 + max(d.MOM_WINDOWS) + 1)
+    FFD = ffd_scores(pm, MIN_TRAIN_YRS*12 + max(MOM_WINDOWS) + 1)
     for m in list(FFD): FFD[m] = FFD[m].reindex(rm.index)
 ADDTS = int(os.environ.get("ADDTS", 1))                                     # DEFAULT ON: TIME-SERIES/trend features (52wk-high, trendR2, tsmom)
 if ADDTS:

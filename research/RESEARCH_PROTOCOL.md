@@ -15,6 +15,22 @@ The mantra: **full universe → clearly DEFINE → clearly MEASURE → clearly A
 
 ---
 
+## PHASE 0 — SUBSTRATE (MANDATORY, no exceptions)
+
+**Every test from now on loads data from `DATAHUB.py` and backtests through `DATAHUB` (daily) or `BACKTEST.py`
+(monthly). NO external / ad-hoc data loaders.** No more `pd.read_parquet("tiingo_daily_close.parquet")` +
+bespoke `me`/`elig`/`mdv` boilerplate in each script, and no `deep_momentum_xgb.load_broad_universe_tiingo`.
+
+- **Data**: `from DATAHUB import DataHub; hub = DataHub()`. Daily-native, split-coherent mcap. It owns the ONE
+  universe definition (`hub.elig("liquid"|"relaxed")`), the price/return/volume panels, fundamentals, and mcap.
+  Monthly strategies (MOM/DM) resample from the same hub (`hub.me`, `hub.m_px`, `hub.mret`, `hub.synth`).
+- **Backtest**: daily → `hub.backtest_daily(W, H, lag, cost_bps)` (honest lag=2, per-side bps). Monthly →
+  `BACKTEST.backtest(...)` with `BACKTEST.tiered_transaction_costs` / `tiered_borrow_fees`.
+- **Why**: one coherent frame = no silent incoherence (the split-basis mcap bug came from mixing adjusted price
+  with as-reported shares across ad-hoc loaders). Comparable numbers require identical substrate.
+
+---
+
 ## THE WALKTHROUGH — run these 8 steps identically for EVERY idea
 
 The point of a fixed walkthrough: **every idea gets identical treatment → results are directly comparable.**
