@@ -33,13 +33,17 @@ class DataHub:
         px = px.loc[:, ~drop]; px = px.loc[:, px.notna().sum() >= min_days]           # trim never-traded junk
         self.px_d = px; self.days = px.index
         self.vol_d = pd.read_parquet("tiingo_daily_volume.parquet").reindex(columns=px.columns).reindex(index=px.index)
-        self.ret_d = px.pct_change(fill_method=None).where(lambda z: z.abs() < 0.5)
+        # HONEST RETURNS: prices are split-ADJUSTED, so a huge move is a REAL move (a squeeze), not an artifact.
+        # The old guards (>=+100%/mo, >=+50%/day -> NaN -> 0) silently ERASED short squeezes — and our alpha is
+        # short-side-heavy, so they flattered the book enormously (VQ SR 2.06 -> 0.76 once squeezes are paid for).
+        # Only absurd moves are treated as data errors now.
+        self.ret_d = px.pct_change(fill_method=None).where(lambda z: z.abs() < 2.0)      # >200%/day = data error
         self.adv_d = (px*self.vol_d).rolling(21, min_periods=10).mean()               # 21d avg dollar volume
         self._sma = {}
         # monthly resample (for MOM/DM + the monthly BACKTEST engine)
         self.me = me = pd.DatetimeIndex(px.index.to_series().resample("ME").last().dropna().values)
         self.me = me = me[me >= pd.Timestamp(start)]
-        self.m_px = px.reindex(me); self.mret = self.m_px.pct_change(fill_method=None).where(lambda z: z < 1.0)
+        self.m_px = px.reindex(me); self.mret = self.m_px.pct_change(fill_method=None).where(lambda z: z < 10.0)  # >1000%/mo = data error
         self.synth = (1 + self.mret.fillna(0.0)).cumprod()
         _dvm = (px*self.vol_d).resample("ME").sum(); _dvm.index = _dvm.index.to_period("M")   # PERIOD align (not ffill:
         self.mdv = _dvm.reindex(pd.PeriodIndex(me, freq="M")); self.mdv.index = me             # calendar-end label vs trading-day me)
@@ -195,11 +199,13 @@ class DataHub:
                 self._cache[k] = (self.px_d * self.vol_d).ffill()
         return self._cache[k]
     def pnl(self, grid="monthly"):
-        """Cleaned synthetic PnL price grid: delisting + per-cell clip [-0.95,3.0] + 1/99 winsor, then cumprod."""
+        """HONEST synthetic PnL price grid: delisting + a DATA-ERROR guard only, then cumprod.
+        The old version cross-sectionally 1/99-winsorized the PnL, which CAPPED short-squeeze losses — the book
+        is short-side-heavy, so that silently erased the one risk that kills short books. Winsorizing is fine for
+        MODELLING labels (see clean_returns) but must NEVER touch the PnL: a +300% squeeze must be paid in full."""
         k = ("pnl", grid)
         if k not in self._cache:
-            px = self.delisted_prices(grid); r = px.pct_change().clip(lower=-0.95, upper=3.0)
-            r = r.clip(r.quantile(0.01, axis=1), r.quantile(0.99, axis=1), axis=0)
+            px = self.delisted_prices(grid); r = px.pct_change().clip(lower=-0.95, upper=10.0)   # >1000% = data error
             self._cache[k] = (1.0 + r.fillna(0.0)).cumprod().where(px.notna())
         return self._cache[k]
 
