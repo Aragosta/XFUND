@@ -103,13 +103,13 @@ def wmat(H, cg):
         rows[store[k]["dt"]] = W
     return pd.DataFrame(rows).T.reindex(columns=synth.columns)
 
-# ONE engine: signal at month t earns t->t+1 (lag=0), freq=12, tiered trade + borrow costs
+# ONE engine: signal at month t-1, trade at month t (lag=1 for realistic next-month execution), freq=12, tiered trade + borrow costs
 out = {}; Wsave = None
 for tag, H, cg in [("1", 1, False), ("3", 3, True)]:
     W = wmat(H, cg); sig = list(W.index)
     if tag == "1": Wsave = W                                                # champion weights (H=1) for attribution
-    g = BACKTEST.backtest(W, synth, freq=12, lag=0, signal_dates=sig)
-    n = BACKTEST.backtest(W, synth, freq=12, lag=0, signal_dates=sig, transaction_cost=tc, borrow_fee=bf)
+    g = BACKTEST.backtest(W, synth, freq=12, lag=1, signal_dates=sig)
+    n = BACKTEST.backtest(W, synth, freq=12, lag=1, signal_dates=sig, transaction_cost=tc, borrow_fee=bf)
     out[f"g{tag}"], out[f"n{tag}"] = g["returns"], n["returns"]
     lbl = "H=1       " if tag == "1" else "H=3 constG"
     print(f"[MOM] {lbl} net SR {n['sharpe']:.2f}  ann {n['ann_return']:.1%}  maxDD {n['max_drawdown']:.1%}"

@@ -53,7 +53,7 @@ def book(vq):                                                                  #
         n=max(1,int(len(s.dropna())*0.10)); s=s.dropna()
         W.loc[d,s.nlargest(n).index]=1.0/n; W.loc[d,s.nsmallest(n).index]=-1.0/n
     W=BETANEUT.betaneut(W,BETA)
-    r=BACKTEST.backtest(W.fillna(0.0),synth,freq=12,lag=0,signal_dates=[d for d in W.index if W.loc[d].abs().sum()>1e-9],transaction_cost=tc,borrow_fee=bf)
+    r=BACKTEST.backtest(W.fillna(0.0),synth,freq=12,lag=1,signal_dates=[d for d in W.index if W.loc[d].abs().sum()>1e-9],transaction_cost=tc,borrow_fee=bf)
     x=pd.Series(r["returns"]); x.index=pd.DatetimeIndex(x.index); return x
 spy=hub.spy_m
 def show(nm,x):

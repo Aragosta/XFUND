@@ -9,7 +9,7 @@ hub=DataHub(); me,m_px,mret,synth,elig=hub.me,hub.m_px,hub.mret,hub.synth,hub.el
 tc=BACKTEST.tiered_transaction_costs(hub.mdv); bf=BACKTEST.tiered_borrow_fees(hub.mdv); SPY=hub.spy_m.dropna()
 def net(W):
     W=W.reindex(index=me,columns=m_px.columns).fillna(0.0)
-    r=BACKTEST.backtest(W,synth,freq=12,lag=0,signal_dates=[d for d in me if W.loc[d].abs().sum()>1e-9],transaction_cost=tc,borrow_fee=bf)
+    r=BACKTEST.backtest(W,synth,freq=12,lag=1,signal_dates=[d for d in me if W.loc[d].abs().sum()>1e-9],transaction_cost=tc,borrow_fee=bf)
     s=pd.Series(r["returns"]); s.index=pd.DatetimeIndex(s.index); return s
 # META alpha (MOM+DM name-sized)
 Wmeta=pickle.load(open("/tmp/meta_weights.pkl","rb")); Wmeta.index=pd.DatetimeIndex(pd.to_datetime(Wmeta.index)); Wmeta=Wmeta[~Wmeta.index.duplicated()]

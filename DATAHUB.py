@@ -87,7 +87,7 @@ class DataHub:
             f = pd.read_parquet(edgar).dropna(subset=["val"]).copy(); f["end"] = pd.to_datetime(f["end"])
         except Exception as e:
             warnings.warn(f"EDGAR load failed ({e}); fundamentals unavailable"); self._f = None; return
-        LAG = {"book":90,"shares":90,"ni":120,"assets":90,"rev":120,"cogs":120}
+        LAG = {"book":120,"shares":120,"ni":150,"assets":120,"rev":150,"cogs":150}
         f["avail"] = f["end"] + pd.to_timedelta(f["concept"].map(LAG).fillna(90), unit="D")
         f = f[f["ticker"].isin(self.px_d.columns)]
         # keep AS-REPORTED shares (concept 'shares_rep') for RAW-price mcap; build split-COHERENT ('shares') for
@@ -217,6 +217,7 @@ class DataHub:
         base = (self.m_px > 5) & (self.cov_m > 0.9)
         if kind == "liquid":  return base & (self.mdv > 5e6)
         if kind == "relaxed": return (self.m_px > 3) & (self.cov_m > 0.8) & (self.mdv > 5e5)
+        if kind == "shortable": return base & (self.mdv > 25e6)  # borrowable: mdv > $25M
         return base
 
 if __name__ == "__main__":
