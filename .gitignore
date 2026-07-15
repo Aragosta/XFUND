@@ -6,6 +6,17 @@ __pycache__/
 *_yf_cache.parquet
 *.parquet
 
+# exceptions: small/critical data committed to repo
+!data/edgar/*.parquet
+!data/monthly_m_px.parquet
+!data/monthly_mdv.parquet
+!data/monthly_mret.parquet
+
+# large raw data — keep local only
+data/13f/
+data/fnspid/
+data/tiingo_ohlc/
+
 # logs
 *.log
 __pycache__/
