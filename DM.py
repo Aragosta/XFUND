@@ -11,7 +11,7 @@ Leak-free: label at horizon h uses rets.iloc[t+h-1]; features frozen at t-1; poo
 import warnings; warnings.filterwarnings("ignore")
 import os, pickle
 import numpy as np, pandas as pd
-from xgboost import XGBClassifier
+from xgboost import XGBClassifier, XGBRegressor
 import BACKTEST
 from DATAHUB import DataHub
 from UNIVERSE import eligibility, ffd_scores
@@ -19,15 +19,21 @@ from features import make_features, MOM_WINDOWS
 
 SEEDS = int(os.environ.get("SEEDS", 5)); TOP_Q, MIN_TRAIN_YRS = 0.05, 10    # champion = seeds=5
 MAXTRAIN = int(os.environ.get("MAXTRAIN", 120)); DEC = 0.10                 # decile cutoffs for top/bottom labels
-XGB = dict(n_estimators=300, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+LONGONLY = int(os.environ.get("LONGONLY", 0))                              # 1 = long top-decile only, no short leg (matches MOM's native book)
+XGB = dict(n_estimators=150, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
            tree_method="hist", multi_strategy="multi_output_tree", objective="binary:logistic", verbosity=0)
+REP = os.environ.get("REP", "hist")                                         # CHAMPION="hist" (K-bucket histogram -> RET reclassification); "dm"=coarse 2-bucket P(top)-P(bot)
+KB  = int(os.environ.get("KB", 10))                                         # histogram buckets
+SMOOTH = float(os.environ.get("SMOOTH", 0))                                 # 0=hard two-hot; >0=HL-Gauss σ (in bin widths)
+TARGET = os.environ.get("TARGET", "ret")                                    # ret = fwd return (DM) | tval = slope/SE t-stat (MOM). (slope/cum/smooth/voladj removed — dominated, T10/T21)
 
 print("[MH-DM] load from DataHub ...", flush=True)
 hub = DataHub(start="2000-01-01", min_days=0)
 pm = hub.delisted_prices("monthly")                                        # delisting-injected (global data eng)
 rm = hub.clean_returns("monthly")                                          # 1/99-winsorized returns (global)
 sm = hub.dollar_size("monthly")                                            # close × month-end volume
-elig, short = eligibility(pm, sm, min_dollar_vol_pct=0.30, min_dollar_vol_abs=1e6)
+MINDVPCT = float(os.environ.get("MINDVPCT", 0.30)); MINDVABS = float(os.environ.get("MINDVABS", 1e6))  # liquidity filter (0/0 = full universe)
+elig, short = eligibility(pm, sm, min_dollar_vol_pct=MINDVPCT, min_dollar_vol_abs=MINDVABS)
 pnl = hub.pnl("monthly"); tcd = BACKTEST.tiered_transaction_costs(sm); bfd = BACKTEST.tiered_borrow_fees(sm)
 me = rm.index; T = len(me); first_feat = max(MOM_WINDOWS) + 1
 
@@ -47,8 +53,6 @@ if ADDTS:
     TSF = {"hi52": pm/pm.rolling(12, min_periods=8).max() - 1, "trendR2": r2,
            "tsmom": (pm/pm.shift(6)-1).where(lambda z: z.abs()<5) * r2}
 
-VOLADJ = int(os.environ.get("VOLADJ", 0))                                   # 1 = target = fwd return / trailing vol
-mvol = rm.rolling(6, min_periods=4).std() if VOLADJ else None               # trailing 6m monthly-return vol
 POOL  = int(os.environ.get("POOL", 0))                                      # 1 = add MOM's resmom + MACD features
 RESID = int(os.environ.get("RESID", 0))                                     # 1 = RESIDUAL-return decile target (Blitz-HM)
 RES = POOLF = None
@@ -66,14 +70,37 @@ if POOL:
         y=q/q.rolling(24,min_periods=12).std(); comp = comp + y*np.exp(-y**2/4)/0.89
     POOLF = {"resmom": resmom, "macd": comp}
 def labels(t, H):
-    """multi-label binary matrix (idx x 2|H|): top/bottom decile of fwd (raw|resid|voladj) return t+h-1."""
+    """multi-label binary matrix (idx x 2|H|): top/bottom decile of fwd (raw|resid) return t+h-1."""
     cols = {}
-    sc = (mvol.iloc[t-1] + 1e-9) if VOLADJ else 1.0                         # vol known at signal date t-1 (point-in-time)
     src = RES if RESID else rm                                             # RESIDUAL-return target if RESID
     for h in H:
-        r = src.iloc[t+h-1] / sc; pr = r.rank(pct=True)
+        r = src.iloc[t+h-1]; pr = r.rank(pct=True)
         cols[f"top{h}"] = (pr >= 1-DEC).astype(float); cols[f"bot{h}"] = (pr <= DEC).astype(float)
     return pd.DataFrame(cols)
+
+def labels_hist(t, H, K):
+    """multi-horizon HISTOGRAM target: soft TWO-HOT over K cross-sectional buckets of fwd return t+h-1, per h.
+    Same target family as DM's top/bot deciles but the FULL distribution (DM = K=2 extremes). idx x (|H|*K)."""
+    src = RES if RESID else rm; out = {}
+    for h in H:
+        if TARGET == "tval":                                              # slope/SE = t-stat = the MOM tval target (h+2 pts so h=1 valid)
+            Y = np.log(pm.iloc[t-1:t+h+1].values.astype(float)); nn = Y.shape[0]; x = np.arange(nn).astype(float); xb = x.mean(); Sxx = max(np.sum((x-xb)**2), 1e-9)
+            with np.errstate(all="ignore"):
+                Ym = np.nanmean(Y, 0); sl = np.nansum((x-xb)[:, None] * (Y - Ym), 0) / Sxx
+                resid = Y - (Ym + (x-xb)[:, None] * sl); se = np.sqrt(np.nansum(resid**2, 0) / max(nn-2, 1) / Sxx)
+                r = pd.Series(sl / (se + 1e-9), index=pm.columns)
+        else:                                                            # ret: single-month fwd return (DM default; residual if RESID)
+            r = src.iloc[t+h-1]
+        idx = r.index; pct = r.rank(pct=True).values; valid = np.isfinite(pct)
+        pos = np.clip(np.nan_to_num(pct) * K - 0.5, 0, K-1)
+        if SMOOTH > 0:                                                     # HL-Gauss: spread mass over bins (Gaussian)
+            kk = np.arange(K)[None, :]; M = np.exp(-0.5 * ((kk - pos[:, None]) / SMOOTH) ** 2); M = M / (M.sum(1, keepdims=True) + 1e-9)
+        else:                                                             # hard two-hot: mass on nearest two bins
+            lo = np.floor(pos).astype(int); frac = pos - lo; hi = np.minimum(lo+1, K-1)
+            M = np.zeros((len(r), K)); a = np.arange(len(r)); M[a, lo] += (1-frac); M[a, hi] += frac
+        M[~valid] = np.nan
+        for k in range(K): out[f"h{h}b{k}"] = pd.Series(M[:, k], index=idx)
+    return pd.DataFrame(out)
 
 def build(H):
     hmax = max(H); pool = {}
@@ -86,7 +113,7 @@ def build(H):
         idx = F.index
         e = elig.iloc[t-1]; idx = idx.intersection(e.index[e.values])
         if len(idx) < 20: continue
-        Y = labels(t, H).reindex(idx)
+        Y = (labels_hist(t, H, KB) if REP == "hist" else labels(t, H)).reindex(idx)
         ok = Y.notna().all(axis=1) & rm.iloc[t].reindex(idx).notna()
         idx = idx[ok.values]
         if len(idx) < 20: continue
@@ -104,19 +131,25 @@ def walk(H):
         if len(ats) >= 18:
             Xtr = pd.concat([pool[t]["F"] for t in ats]).values
             Ytr = np.vstack([pool[t]["Y"] for t in ats])
-            model = [XGBClassifier(**XGB, random_state=s).fit(Xtr, Ytr) for s in range(SEEDS)]
+            model = [(XGBRegressor if REP == "hist" else XGBClassifier)(**XGB, random_state=s).fit(Xtr, Ytr) for s in range(SEEDS)]
         if model is None: continue
-        nlab = len(H)
+        nlab = len(H); centers = np.arange(KB) - (KB - 1) / 2.0
         for t in months:
-            p = pool[t]; P = np.mean([np.asarray(m.predict_proba(p["F"].values)) for m in model], axis=0)
-            P = P.reshape(len(p["F"]), 2*nlab)                              # [top@h.., bot@h..]
-            sc = P[:, :nlab].sum(1) - P[:, nlab:].sum(1)                    # Σ P(top) − Σ P(bot)
+            p = pool[t]
+            if REP == "hist":                                              # read the tilt off the predicted histogram (law of total expectation)
+                Q = np.mean([m.predict(p["F"].values) for m in model], axis=0).reshape(len(p["F"]), nlab, KB)
+                Q = Q / (Q.sum(2, keepdims=True) + 1e-9); sc = (Q * centers).sum(2).mean(1)
+            else:
+                P = np.mean([np.asarray(m.predict_proba(p["F"].values)) for m in model], axis=0).reshape(len(p["F"]), 2*nlab)
+                sc = P[:, :nlab].sum(1) - P[:, nlab:].sum(1)               # Σ P(top) − Σ P(bot)
             s = pd.Series(sc, index=p["F"].index)
             ics.append(np.corrcoef(pd.Series(sc).rank(), pd.Series(p["fwd"].values).rank())[0,1])
             sh = short.iloc[t-1]; shortable = s.index.intersection(sh.index[sh.values])
-            n = max(1, int(len(s)*TOP_Q)); w = pd.Series(0.0, index=s.index)
+            q = 0.10 if LONGONLY else TOP_Q                                # long-decile (10%) when long-only, else 5% L/S
+            n = max(1, int(len(s)*q)); w = pd.Series(0.0, index=s.index)
             w[s.nlargest(n).index] = 1.0/n
-            w[s.reindex(shortable).nsmallest(n).index] = -1.0/n            # short only borrowable
+            if not LONGONLY:
+                w[s.reindex(shortable).nsmallest(n).index] = -1.0/n        # short only borrowable
             store[me[t-1]] = w                                             # signal end of t-1, earns t
     W = pd.DataFrame(store).T.reindex(columns=pnl.columns).sort_index(); sig = list(W.index)
     net = BACKTEST.backtest(W, pnl, freq=12, lag=0, signal_dates=sig, transaction_cost=tcd, borrow_fee=bfd)
@@ -124,13 +157,9 @@ def walk(H):
 
 print("="*70); print("DM SLEEVE — MULTI-HORIZON multi-label classification (Han + TS features, seeds=5) — net via BACKTEST.py")
 print(f"  {'arm':16}{'IC':>9}{'net SR':>9}{'ann':>8}{'maxDD':>8}{'turn':>7}")
-ARMSEL = os.environ.get("ARM", "mh")                                       # default: MH champion only
-out = {}
-_arms = [("SH-DM (1)", (1,)), ("MH-DM (1,2,3)", (1,2,3))]
-if ARMSEL == "mh": _arms = [("MH-DM (1,2,3)", (1,2,3))]
-for nm, H in _arms:
-    ic, r, W = walk(H); out[nm] = (ic, r["sharpe"])
-    print(f"  {nm:16}{ic:>9.4f}{r['sharpe']:>9.2f}{r['ann_return']:>8.1%}{r['max_drawdown']:>8.1%}{r['ann_turnover']:>7.1f}", flush=True)
-    if "MH" in nm:                                                          # the champion book -> canonical dm_weights
-        pickle.dump(W, open("/tmp/dm_weights.pkl","wb")); pickle.dump(r["returns"], open("/tmp/dm_returns.pkl","wb"))
-print("[done] DM book -> /tmp/dm_weights.pkl", flush=True)
+# CHAMPION ONLY: MH-DM (1,2,3) — 2-bucket P(top)-P(bot) on RETURNS, multi-horizon. (SH-DM single-horizon arm removed.)
+nm, H = "MH-DM (1,2,3)", (1, 2, 3)
+ic, r, W = walk(H)
+print(f"  {nm:16}{ic:>9.4f}{r['sharpe']:>9.2f}{r['ann_return']:>8.1%}{r['max_drawdown']:>8.1%}{r['ann_turnover']:>7.1f}", flush=True)
+pickle.dump(W, open("/tmp/dm_weights.pkl", "wb")); pickle.dump(r["returns"], open("/tmp/dm_returns.pkl", "wb"))
+print("[done] DM champion book -> /tmp/dm_weights.pkl", flush=True)

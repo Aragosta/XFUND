@@ -21,9 +21,9 @@ from sklearn.isotonic import IsotonicRegression
 import BACKTEST, BETANEUT, ERC
 
 # ---------- DATA / GRID ----------
-px = pd.read_parquet("tiingo_daily_close.parquet").sort_index()
+px = pd.read_parquet("data/daily.parquet")["close"].sort_index()
 t = px.columns.str.match(r"^Z[A-Z]ZZT$") | px.columns.isin(["ZXYZ","ZTEST","ZVV","ZBZX","ZBZZT"]); px = px.loc[:, ~t]
-vb = pd.read_parquet("tiingo_daily_volume.parquet").reindex(columns=px.columns).reindex(index=px.index)
+vb = pd.read_parquet("data/daily.parquet")["volume"].reindex(columns=px.columns).reindex(index=px.index)
 me = pd.DatetimeIndex(px.index.to_series().resample("ME").last().dropna().values); me = me[me >= pd.Timestamp("2010-12-01")]
 m_px = px.reindex(me); mret = m_px.pct_change(fill_method=None).where(lambda z: z < 1.0); synth = (1 + mret.fillna(0.0)).cumprod()
 mdv = (px*vb).resample("ME").sum().reindex(me, method="ffill"); cov = px.notna().rolling(252, min_periods=200).mean().reindex(me, method="ffill")

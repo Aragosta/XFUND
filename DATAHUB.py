@@ -19,6 +19,7 @@ API:
   hub.M(daily_panel)                                            # resample any daily panel -> month-end
 """
 import warnings; warnings.filterwarnings("ignore")
+import os
 import numpy as np, pandas as pd
 
 _CLEAN = np.array([1.5,2,3,4,5,6,7,8,10,12,15,20,25,30]); _CLEAN = np.concatenate([_CLEAN, 1/_CLEAN])
@@ -28,44 +29,94 @@ def _snap_split(r):
 
 class DataHub:
     def __init__(self, start="2010-12-01", edgar="data/edgar/facts.parquet", min_days=250):
-        px = pd.read_parquet("tiingo_daily_close.parquet").sort_index()
+        import os
+        _daily_ok = os.path.exists("data/daily.parquet")
+        if _daily_ok:
+            self._init_daily(start, min_days)
+        else:
+            warnings.warn("Daily parquets not found — loading from monthly snapshot (backtesting works; MOM daily features unavailable)")
+            self._init_monthly(start)
+        self._load_edgar(edgar); self._cache = {}
+        self.spy_m = self._load_spy()
+        self.macro_m = self._load_macro()
+        try:
+            _sic = pd.read_parquet("data/edgar/sic.parquet")
+            cols = self.px_d.columns if self.px_d is not None else self.m_px.columns
+            self.sector = pd.Series(_sic.set_index("ticker")["sector2"]).reindex(cols)
+        except Exception: self.sector = None
+
+    def _load_macro(self):
+        """Curated macro panel (FRED), month-end aligned, PIT-safe. Columns: y2, y10, slope_2s10s, credit
+        (Baa-10Y), breakeven (10Y), vix. These are market-observable at each month-end close, so aligning to
+        the last observation ON OR BEFORE `me` uses only information available at the signal date (no look-ahead).
+        Returns a monthly DataFrame indexed by `me`, or None if data/macro.parquet is absent."""
+        try:
+            mac = pd.read_parquet("data/macro.parquet"); mac.index = pd.DatetimeIndex(mac.index)
+            out = mac.reindex(self.me, method="ffill")                 # last obs on/before each month-end
+            cols = ["y2", "y10", "slope_2s10s", "credit", "breakeven", "vix", "funding", "vix_ts", "ted"]
+            return out.reindex(columns=[c for c in cols if c in out.columns])
+        except Exception:
+            return None
+
+    def _init_daily(self, start, min_days):                             # SELF-CONTAINED: single consolidated OHLCV store
+        big = pd.read_parquet("data/daily.parquet").sort_index()
+        px = big["close"].astype(float)
         drop = px.columns.str.match(r"^Z[A-Z]ZZT$") | px.columns.isin(["ZXYZ","ZTEST","ZVV","ZBZX","ZBZZT"])
-        px = px.loc[:, ~drop]; px = px.loc[:, px.notna().sum() >= min_days]           # trim never-traded junk
+        px = px.loc[:, ~drop]; px = px.loc[:, px.notna().sum() >= min_days]
         self.px_d = px; self.days = px.index
-        self.vol_d = pd.read_parquet("tiingo_daily_volume.parquet").reindex(columns=px.columns).reindex(index=px.index)
-        # HONEST RETURNS: prices are split-ADJUSTED, so a huge move is a REAL move (a squeeze), not an artifact.
-        # The old guards (>=+100%/mo, >=+50%/day -> NaN -> 0) silently ERASED short squeezes — and our alpha is
-        # short-side-heavy, so they flattered the book enormously (VQ SR 2.06 -> 0.76 once squeezes are paid for).
-        # Only absurd moves are treated as data errors now.
-        self.ret_d = px.pct_change(fill_method=None).where(lambda z: z.abs() < 2.0)      # >200%/day = data error
-        self.adv_d = (px*self.vol_d).rolling(21, min_periods=10).mean()               # 21d avg dollar volume
-        self._sma = {}
-        # monthly resample (for MOM/DM + the monthly BACKTEST engine)
+        self.vol_d  = big["volume"].reindex(columns=px.columns).astype(float)
+        self.open_d = big["open"].reindex(columns=px.columns).astype(float)
+        self.high_d = big["high"].reindex(columns=px.columns).astype(float)
+        self.low_d  = big["low"].reindex(columns=px.columns).astype(float)
+        del big
+        self.ret_d = px.pct_change(fill_method=None).where(lambda z: z.abs() < 2.0)
+        self.adv_d = (px*self.vol_d).rolling(21, min_periods=10).mean()
+        self._sma = {}; self._rvol = {}
         self.me = me = pd.DatetimeIndex(px.index.to_series().resample("ME").last().dropna().values)
         self.me = me = me[me >= pd.Timestamp(start)]
-        self.m_px = px.reindex(me); self.mret = self.m_px.pct_change(fill_method=None).where(lambda z: z < 10.0)  # >1000%/mo = data error
+        self.m_px = px.reindex(me); self.mret = self.m_px.pct_change(fill_method=None).where(lambda z: z < 10.0)
         self.synth = (1 + self.mret.fillna(0.0)).cumprod()
-        _dvm = (px*self.vol_d).resample("ME").sum(); _dvm.index = _dvm.index.to_period("M")   # PERIOD align (not ffill:
-        self.mdv = _dvm.reindex(pd.PeriodIndex(me, freq="M")); self.mdv.index = me             # calendar-end label vs trading-day me)
+        _dvm = (px*self.vol_d).resample("ME").sum(); _dvm.index = _dvm.index.to_period("M")
+        self.mdv = _dvm.reindex(pd.PeriodIndex(me, freq="M")); self.mdv.index = me
         self.cov_m = px.notna().rolling(252, min_periods=200).mean().reindex(me, method="ffill")
-        self._load_edgar(edgar); self._cache = {}
-        # RAW (unadjusted) monthly close -> correct mcap = raw_price × as-reported shares (both same split basis)
         self.raw_m_px = None
         try:
             rp = pd.read_parquet("data/tiingo_raw_monthly.parquet"); rp.index = pd.to_datetime(rp.index)
             rp.index = rp.index.to_period("M"); ra = rp.reindex(pd.PeriodIndex(self.me, freq="M")); ra.index = self.me
             self.raw_m_px = ra.reindex(columns=self.px_d.columns)
         except Exception: pass
-        self.spy_m = self._load_spy()                                            # SPY buy-and-hold benchmark (monthly return)
-        try:                                                                     # SIC industry (2-digit sector) per ticker
-            _sic = pd.read_parquet("data/edgar/sic.parquet")
-            self.sector = pd.Series(_sic.set_index("ticker")["sector2"]).reindex(self.px_d.columns)
-        except Exception: self.sector = None
+
+    def _init_monthly(self, start):
+        """Monthly-mode: loads from committed snapshots. Backtesting + fundamentals work; daily features unavailable."""
+        self.px_d = None; self.vol_d = None; self.ret_d = None; self.adv_d = None
+        self.days = None; self._sma = {}; self.raw_m_px = None
+        self.m_px  = pd.read_parquet("data/monthly_m_px.parquet")
+        self.mdv   = pd.read_parquet("data/monthly_mdv.parquet")
+        self.mret  = pd.read_parquet("data/monthly_mret.parquet")
+        self.m_px.index = pd.DatetimeIndex(self.m_px.index)
+        self.mdv.index  = pd.DatetimeIndex(self.mdv.index)
+        self.mret.index = pd.DatetimeIndex(self.mret.index)
+        self.me = me = self.m_px.index[self.m_px.index >= pd.Timestamp(start)]
+        self.m_px = self.m_px.reindex(me); self.mret = self.mret.reindex(me); self.mdv = self.mdv.reindex(me)
+        self.synth = (1 + self.mret.fillna(0.0)).cumprod()
+        # approximate rolling coverage from monthly notna (12-month window ≈ daily 252-day)
+        self.cov_m = self.m_px.notna().astype(float).rolling(12, min_periods=10).mean().reindex(me)
+        try:
+            self.cov_m = pd.read_parquet("data/monthly_cov.parquet")
+            self.cov_m.index = pd.DatetimeIndex(self.cov_m.index)
+            self.cov_m = self.cov_m.reindex(me)
+        except Exception: pass
     def fund(self, concept, grid="monthly"): return self._get(concept, grid)     # any PIT fundamental concept
 
     def _load_spy(self):
-        """SPY buy-and-hold monthly return, aligned to `me` — the market benchmark (we want to be up when SPY is up)."""
+        """SPY buy-and-hold monthly return, aligned to `me`."""
         import os
+        # committed monthly snapshot (fastest path)
+        try:
+            s = pd.read_parquet("data/monthly_spy.parquet")
+            s.index = pd.DatetimeIndex(s.index)
+            out = s["spy_ret"].reindex(self.me); return out
+        except Exception: pass
         for p in ("data/spy.parquet", "/tmp/spy.parquet"):
             try:
                 if os.path.exists(p):
@@ -76,9 +127,33 @@ class DataHub:
         return None
 
     def sma_d(self, w=200):
+        if self.px_d is None: raise RuntimeError("sma_d unavailable in monthly-mode (no daily data)")
         if w not in self._sma: self._sma[w] = self.px_d.rolling(w, min_periods=int(w*0.75)).mean()
         return self._sma[w]
-    def M(self, daily_panel):                                                        # daily -> month-end
+
+    def rvol(self, window=21, method="gk", grid="daily"):
+        """Per-asset realized volatility (daily σ) — GLOBAL, shared by all sleeves (MOM nret, MR speed feat, VQ low-vol).
+        method: 'gk'=Garman-Klass (DEFAULT; best future-RV predictor ρ≈0.70, Garman-Klass 1980), 'yz'=Yang-Zhang 2000
+        (drift+gap-independent, min-variance), 'cc'=close-to-close. Range methods fall back to 'cc' if OHLC absent."""
+        if self.px_d is None: raise RuntimeError("rvol unavailable in monthly-mode (no daily data)")
+        key = (window, method)
+        if key not in self._rvol:
+            n, mp, C = window, int(window*0.7), self.px_d
+            if method in ("gk", "yz") and self.high_d is not None:
+                lc, lo, lh, ll = np.log(C), np.log(self.open_d), np.log(self.high_d), np.log(self.low_d)
+                if method == "gk":
+                    v = np.sqrt((0.5*(lh-ll)**2 - (2*np.log(2)-1)*(lc-lo)**2).rolling(n, min_periods=mp).mean())
+                else:                                                    # Yang-Zhang
+                    o_, c_ = lo - lc.shift(1), lc - lo; k = 0.34/(1.34 + (n+1)/(n-1))
+                    v = np.sqrt((o_.rolling(n, min_periods=mp).var() + k*c_.rolling(n, min_periods=mp).var()
+                                 + (1-k)*((lh-lc)*(lh-lo) + (ll-lc)*(ll-lo)).rolling(n, min_periods=mp).mean()).clip(lower=0))
+            else:
+                v = self.ret_d.rolling(n, min_periods=mp).std()          # close-to-close
+            self._rvol[key] = v
+        v = self._rvol[key]
+        return v.reindex(self.me, method="ffill") if grid == "monthly" else v
+    def M(self, daily_panel):
+        if self.days is None: raise RuntimeError("M() unavailable in monthly-mode (no daily data)")
         return daily_panel.reindex(self.days).resample("ME").last().reindex(self.me)
 
     # ---------- fundamentals: split-coherence done ONCE at report level ----------
@@ -89,7 +164,8 @@ class DataHub:
             warnings.warn(f"EDGAR load failed ({e}); fundamentals unavailable"); self._f = None; return
         LAG = {"book":120,"shares":120,"ni":150,"assets":120,"rev":150,"cogs":150}
         f["avail"] = f["end"] + pd.to_timedelta(f["concept"].map(LAG).fillna(90), unit="D")
-        f = f[f["ticker"].isin(self.px_d.columns)]
+        cols = self.px_d.columns if self.px_d is not None else self.m_px.columns
+        f = f[f["ticker"].isin(cols)]
         # keep AS-REPORTED shares (concept 'shares_rep') for RAW-price mcap; build split-COHERENT ('shares') for
         # the fallback (adjusted-price) mcap when raw price is unavailable.
         sh = f[f.concept == "shares"].sort_values(["ticker","avail","end"]).copy()
@@ -212,6 +288,7 @@ class DataHub:
     # ---------- one universe definition, shared by all sleeves ----------
     def elig(self, kind="liquid", grid="monthly"):
         if grid == "daily":
+            if self.px_d is None: raise RuntimeError("elig(daily) unavailable in monthly-mode")
             base = (self.px_d > 5) & self.px_d.notna() & self.adv_d.notna()
             return base & (self.adv_d > 5e6) if kind == "liquid" else base & (self.adv_d > 5e5)
         base = (self.m_px > 5) & (self.cov_m > 0.9)
