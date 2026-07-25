@@ -20,3 +20,7 @@ data/tiingo_ohlc/
 # logs
 *.log
 __pycache__/
+
+# hard-to-borrow raw feeds — regenerable via research/build_htb.py (1.1GB: 595M FTD zips + 455M short-vol)
+data/htb/raw_ftd/
+data/htb/raw_svol/

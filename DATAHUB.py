@@ -62,6 +62,11 @@ class DataHub:
         big = pd.read_parquet("data/daily.parquet").sort_index()
         px = big["close"].astype(float)
         drop = px.columns.str.match(r"^Z[A-Z]ZZT$") | px.columns.isin(["ZXYZ","ZTEST","ZVV","ZBZX","ZBZZT"])
+        try:                                                       # exclude ETFs/funds — equity factor sleeves need
+            at = pd.read_parquet("data/tiingo_assettype.parquet").drop_duplicates("ticker").set_index("ticker")
+            atype = at["assetType"].reindex(px.columns).fillna("Stock")   # unknown ticker -> assume Stock, KEEP it
+            drop = drop | (atype != "Stock").values
+        except Exception: pass
         px = px.loc[:, ~drop]; px = px.loc[:, px.notna().sum() >= min_days]
         self.px_d = px; self.days = px.index
         self.vol_d  = big["volume"].reindex(columns=px.columns).astype(float)
@@ -162,6 +167,10 @@ class DataHub:
             f = pd.read_parquet(edgar).dropna(subset=["val"]).copy(); f["end"] = pd.to_datetime(f["end"])
         except Exception as e:
             warnings.warn(f"EDGAR load failed ({e}); fundamentals unavailable"); self._f = None; return
+        # drop non-positive shares/assets (isolated SEC data errors: shares<=0 corrupts mcap for real names like
+        # AA/BAC; assets<=0 breaks GP/A) — keep only physically valid values so _pit never serves them. NOT book:
+        # negative stockholders' equity is a real state (buyback-heavy firms), and the value signals guard with .where(book>0).
+        f = f[~(f["concept"].isin(("shares", "assets")) & (f["val"] <= 0))]
         LAG = {"book":120,"shares":120,"ni":150,"assets":120,"rev":150,"cogs":150}
         f["avail"] = f["end"] + pd.to_timedelta(f["concept"].map(LAG).fillna(90), unit="D")
         cols = self.px_d.columns if self.px_d is not None else self.m_px.columns
@@ -198,7 +207,8 @@ class DataHub:
         if ck in self._cache: return self._cache[ck]
         px = self.px_d if grid == "daily" else self.m_px
         RAW = ("book","shares","ni","assets","rev","cogs","ocf","debt_lt","inventory","receivables",
-               "assets_cur","liab_cur","cash","capex","dividends","gross_profit")
+               "assets_cur","liab_cur","cash","capex","dividends","gross_profit","rnd",
+               "opinc","sga","intexp","tax")                                     # opinc=OperatingIncomeLoss (true EBIT)
         if key in RAW: v = self._pit(key, grid)
         elif key == "mcap":
             # TESTED: raw_price × as-reported shares is WORSE (IC(B/M) +0.022 -> -0.007) — a split hits price
@@ -228,14 +238,8 @@ class DataHub:
         L = L.div(L.sum(1).replace(0,np.nan), axis=0); Sh = Sh.div(Sh.sum(1).replace(0,np.nan), axis=0)
         return (L - Sh).fillna(0.0)
 
-    def backtest_daily(self, W_target, H=5, lag=2, cost_bps=5.0):
-        """Honest daily engine: overlapping H-day tranches, strict next-close exec (signal[d]->earn d+2 => lag=2),
-        per-side bps on daily turnover. Returns (gross, net, avg_daily_turnover)."""
-        Wbook = W_target.rolling(H, min_periods=1).mean()
-        gross = (Wbook.shift(lag) * self.ret_d).sum(axis=1)
-        turn = (Wbook - Wbook.shift(1)).abs().sum(axis=1)
-        net = gross - (cost_bps/1e4) * turn.shift(lag)
-        return gross.dropna(), net.dropna(), turn.mean()
+    # NOTE: backtesting is done ONLY through BACKTEST.py (the single honest engine — RESEARCH_PROTOCOL).
+    # A convenience `backtest_daily` was removed so no sleeve accidentally forks the engine.
 
     @staticmethod
     def stats(x, ann=252):

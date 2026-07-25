@@ -18,7 +18,7 @@ import numpy as np, pandas as pd, pickle
 from scipy.stats import skew
 from xgboost import XGBClassifier
 from sklearn.isotonic import IsotonicRegression
-import BACKTEST, BETANEUT, ERC
+import BACKTEST, RISK, ERC
 
 # ---------- DATA / GRID ----------
 px = pd.read_parquet("data/daily.parquet")["close"].sort_index()
@@ -29,14 +29,14 @@ m_px = px.reindex(me); mret = m_px.pct_change(fill_method=None).where(lambda z: 
 mdv = (px*vb).resample("ME").sum().reindex(me, method="ffill"); cov = px.notna().rolling(252, min_periods=200).mean().reindex(me, method="ffill")
 elig = (m_px > 5) & (cov > 0.9) & (mdv > 5e6); tc = BACKTEST.tiered_transaction_costs(mdv); bf = BACKTEST.tiered_borrow_fees(mdv); meP = pd.PeriodIndex(me, freq="M")
 volm = (px.pct_change(fill_method=None).ewm(span=63, min_periods=20).std()*np.sqrt(21)).reindex(me, method="ffill")
-BETA = BETANEUT.rolling_beta(mret, elig, bw=60)
+BETA = RISK.rolling_beta(mret, elig, bw=60)
 def to_grid(W):
     W = W.copy(); W.index = pd.PeriodIndex(pd.DatetimeIndex(W.index), freq="M"); W = W[~W.index.duplicated()].reindex(meP); W.index = me
     return W.reindex(columns=px.columns).astype(float)
 
 # ---------- SLEEVES: load + beta-neutralize ----------
 Wmom = to_grid(pickle.load(open("/tmp/mom_weights.pkl","rb"))); Wdm = to_grid(pickle.load(open("/tmp/dm_weights.pkl","rb")))
-Wmom_bn = BETANEUT.betaneut(Wmom, BETA); Wdm_bn = BETANEUT.betaneut(Wdm, BETA)
+Wmom_bn = RISK.betaneut(Wmom, BETA); Wdm_bn = RISK.betaneut(Wdm, BETA)
 
 # ---------- ERC combine (capital, sleeve-level) ----------
 def netstream(W):
@@ -97,7 +97,7 @@ def book(sized):
             pm = pmat.loc[d]; isd = pm.notna()
             if isd.any(): mult[isd] = (pm[isd]/(1-pm[isd])).clip(0, 10)     # calibrated odds
         w = werc*mult
-        W.loc[d] = BETANEUT.neutralize(w[w != 0], BETA.loc[d]).reindex(px.columns).fillna(0.0) if (w != 0).any() else 0.0
+        W.loc[d] = RISK.neutralize(w[w != 0], BETA.loc[d]).reindex(px.columns).fillna(0.0) if (w != 0).any() else 0.0
     return W
 def rep(name, W):
     r = BACKTEST.backtest(W.fillna(0.0), synth, freq=12, lag=0, signal_dates=[d for d in W.index if W.loc[d].abs().sum() > 1e-9], transaction_cost=tc, borrow_fee=bf)

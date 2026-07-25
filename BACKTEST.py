@@ -219,7 +219,12 @@ def _metrics(equity, turnover, cost_frac, borrow_frac, freq, rf) -> dict:
     r = net_ret.to_numpy()[1:]
     n = len(r)
     total_factor = float(equity.iloc[-1] / equity.iloc[0])
-    ann_return = total_factor ** (freq / n) - 1.0 if n > 0 else np.nan
+    # A book that loses more than 100% drives equity <= 0, and a NEGATIVE base to a fractional power is
+    # COMPLEX -> every downstream metric raises TypeError. Report a total loss instead of crashing the run.
+    if not np.isfinite(total_factor) or total_factor <= 0:
+        ann_return = -1.0
+    else:
+        ann_return = total_factor ** (freq / n) - 1.0 if n > 0 else np.nan
     ann_vol = float(np.std(r, ddof=1) * np.sqrt(freq)) if n > 1 else np.nan
     rf_per = (1.0 + rf) ** (1.0 / freq) - 1.0
     sharpe = float((r.mean() - rf_per) / np.std(r, ddof=1) * np.sqrt(freq)) if (n > 1 and ann_vol > 0) else np.nan
@@ -365,6 +370,7 @@ def walk_forward(
     freq: int = 252,
     lag: int = 1,
     transaction_cost=0.0,
+    borrow_fee=0.0,
     risk_free_rate: float = 0.0,
     signal_kwargs: dict | None = None,
 ) -> dict:
@@ -416,7 +422,7 @@ def walk_forward(
     return backtest(
         weights, oos_px,
         freq=freq, lag=lag, signal_dates=sorted(weight_rows),
-        transaction_cost=transaction_cost, risk_free_rate=risk_free_rate,
+        transaction_cost=transaction_cost, borrow_fee=borrow_fee, risk_free_rate=risk_free_rate,
     )
 
 

@@ -107,6 +107,13 @@ for f in FACS: F[f"vol_{f}"] = facvol[f]
 F["disp"] = mret.where(elig).std(axis=1)
 mktm = mret.where(elig).mean(axis=1); mkt_cum = (1 + mktm.fillna(0)).cumprod()
 F["mkt_2yr"] = mkt_cum / mkt_cum.shift(24) - 1; F["mkt_1m"] = mktm; F["bear"] = (F["mkt_2yr"] < 0).astype(float)
+# ── MOMENTUM-FACTOR AUTOCORRELATION STATE (Ehsani-Linnainmaa crash timer) ──────────
+# Mechanism: cross-sectional momentum = timing factor autocorrelation; it pays while the momentum
+# factor stays positively autocorrelated and CRASHES when that autocorrelation breaks/flips. So the
+# trailing AC(1) of the momentum factor return is a continuous, model-free crash-state INPUT (STATE style).
+mf = MFAC["mom"]                                                       # monthly momentum-factor L/S return
+def _rollac(s, w): return s.rolling(w, min_periods=max(4, w // 2)).apply(lambda x: pd.Series(x).autocorr(lag=1), raw=False)
+F["mom_ac12"] = _rollac(mf, 12); F["mom_ac6"] = _rollac(mf, 6)         # trailing factor-return autocorrelation
 if hub.macro_m is not None:                                            # raw macro regime cols (sleeves split on these)
     for c in ["credit", "vix", "slope_2s10s", "breakeven", "y10", "funding", "vix_ts"]:
         if c in hub.macro_m: F[c] = hub.macro_m[c]
@@ -129,6 +136,14 @@ def dcorr(c):
     e = pd.DataFrame({"x": Dw[c], "y": nxt.reindex(Dw.index)}).dropna(); return e["x"].corr(e["y"]) if len(e) > 24 else np.nan
 print("\n[state] ONE object (Sigma_t) -> read-outs. Diagnostics (corr with next-mo ref-book return, 2011-26):")
 print(f"   ENB {dcorr('enb'):+.2f} (low=coupled, +exp)   surprise {dcorr('surprise'):+.2f}   sig_port {dcorr('sig_port'):+.2f}   vix {dcorr('vix'):+.2f}")
+# MOM-AUTOCORR crash-timer diagnostic: does trailing factor AC lead momentum's own forward return / crash?
+mnx1 = mf.shift(-1); mf6 = mf.rolling(6).sum().shift(-6)               # next-1mo and next-6mo momentum-factor return (fwd)
+def _c(a, b):
+    e = pd.DataFrame({"x": Dw[a] if a in Dw else F[a].reindex(Dw.index), "y": b.reindex(Dw.index)}).dropna(); return e["x"].corr(e["y"]) if len(e) > 24 else np.nan
+lo = Dw["mom_ac12"] < Dw["mom_ac12"].median()
+print(f"[state] MOM-AC crash timer: corr(ac12, mom_next1) {_c('mom_ac12', mnx1):+.2f}  corr(ac12, mom_fwd6) {_c('mom_ac12', mf6):+.2f}"
+      f"   mom_fwd6 mean  loAC {mf6.reindex(Dw.index)[lo].mean():+.3f}  hiAC {mf6.reindex(Dw.index)[~lo].mean():+.3f}"
+      f"   ac12 range [{Dw['mom_ac12'].min():+.2f},{Dw['mom_ac12'].max():+.2f}]")
 print(f"   ENB range [{enb.dropna().min():.1f},{enb.dropna().max():.1f}] / {len(SECS)} sectors   gross range [{gross.dropna().min():.2f},{gross.dropna().max():.2f}]  mean {gross.mean():.2f}")
 print("\nSaved: /tmp/state_cov.parquet (Sigma_t -> ERC/construction), /tmp/state_dial.parquet (gross dial -> risk layer),")
 print("       /tmp/state_feat.parquet (lean regime features -> sleeves). ONE object, read-outs only. No regime model.")

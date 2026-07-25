@@ -166,12 +166,15 @@ class MomLayer:
         self.score = pd.DataFrame({pool[k]["dt"]: score[k] for k in score}).T.reindex(columns=self.cols)
         return self.score
 
-    # ── validation book: long top decile, discard bottom, net of costs ─────────
-    def backtest(self, decile: float = 0.10, ls: bool = False):
-        # ls=False: long top-decile + discard bottom (the sleeve's native book).
-        # ls=True : L/S dollar-neutral (long top decile +1/n, short bottom decile -1/n) — matches DM's construction.
+    # ── validation book: constructed via the shared CONSTRUCT layer (liquidity sizing + banding), net of costs ──
+    def backtest(self, weighting: str = "mdv", band=(0.10, 0.20), decile: float = 0.10, ls: bool = False):
+        # Construction is the SHARED CONSTRUCT layer (scores→weights). Default = mdv-weighted + banded = the +0.47-SR
+        # win over the old equal-weight decile (research/MOM_research.md T29). Knobs: weighting/band (capacity setting
+        # = sqrt_mdv, band=(.10,.30)). ls=False long-only (discard the rest); ls=True dollar-neutral, borrowable shorts.
+        import RISK
         tc = BACKTEST.tiered_transaction_costs(self.sm); bf = BACKTEST.tiered_borrow_fees(self.sm)
-        rows, ics = {}, []
+        W = RISK.risk_book(self.score, self.hub, tier=self.tier, weighting=weighting, band=band, decile=decile, ls=ls)
+        ics = []                                               # rank-IC of the score vs next-month realized (diagnostic)
         for k in self.keys:
             dt = self.pool[k]["dt"]
             if dt not in self.score.index: continue
@@ -179,14 +182,6 @@ class MomLayer:
             if len(s) < 20: continue
             fwd = pd.Series(self.pool[k]["fwd"], index=self.pool[k]["idx"]).reindex(s.index)
             ics.append(spearmanr(s.values, fwd.values).correlation)
-            n = max(1, int(len(s) * decile)); w = pd.Series(0.0, index=s.index)
-            w[s.nlargest(n).index] = 1.0 / n
-            if ls:                                             # dollar-neutral short leg — BORROWABLE names only (global filter)
-                sh = pd.Series(self.pool[k]["short_ok"], index=self.pool[k]["idx"]).reindex(s.index).fillna(False)
-                cand = s[sh.values]; ns = max(1, int(len(cand) * decile))
-                w[cand.nsmallest(ns).index] = -1.0 / ns
-            rows[dt] = w
-        W = pd.DataFrame(rows).T.reindex(columns=self.pnl.columns)
         r = BACKTEST.backtest(W, self.pnl, freq=12, lag=0, signal_dates=list(W.index), transaction_cost=tc, borrow_fee=bf)
         r["rankIC"] = float(np.nanmean(ics)); return r
 
@@ -200,9 +195,9 @@ class MomLayer:
 if __name__ == "__main__":
     seeds = int(os.environ.get("SEEDS", 5)); topn = os.environ.get("TOPN"); topn = int(topn) if topn else None
     addffd = bool(int(os.environ.get("ADDFFD", 0))); poolf = bool(int(os.environ.get("POOL", 0)))
+    tier = os.environ.get("TIER", "liquid")                          # DATAHUB global universe tier
     print(f"[MOM] build  seeds={seeds}  maxtrain=72  tier={tier}  topn={topn or 'all'}  target=tval@6  centers=gaussian"
           f"  feats=DM(make_features+TS{'+FFD' if addffd else ''}{'+pool' if poolf else ''})  shorts=borrowable", flush=True)
-    tier = os.environ.get("TIER", "liquid")                          # DATAHUB global universe tier
     ml = MomLayer(seeds=seeds, topn=topn, addffd=addffd, pool=poolf, tier=tier)
     ml.build()
     rL = ml.backtest(ls=False); rLS = ml.backtest(ls=True)
